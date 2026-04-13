@@ -25,9 +25,27 @@ namespace AuthForge
 
         private readonly object _lock = new object();
         private readonly HttpClient _httpClient;
+        private readonly HashSet<string> _knownServerErrors = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "invalid_app",
+            "invalid_key",
+            "expired",
+            "revoked",
+            "hwid_mismatch",
+            "no_credits",
+            "blocked",
+            "rate_limited",
+            "replay_detected",
+            "app_disabled",
+            "session_expired",
+            "bad_request",
+            "checksum_required",
+            "checksum_mismatch",
+        };
 
         private Thread? _heartbeatThread;
         private bool _heartbeatStarted;
+        private bool _heartbeatStop;
 
         private string? _licenseKey;
         private string? _sessionToken;
@@ -36,6 +54,10 @@ namespace AuthForge
         private string? _rawPayloadB64;
         private string? _signature;
         private byte[]? _derivedKey;
+        private Dictionary<string, object?>? _sessionData;
+        private Dictionary<string, object?>? _appVariables;
+        private Dictionary<string, object?>? _licenseVariables;
+        private bool _authenticated;
         private readonly string _hwid;
 
         public string AppId { get; }
@@ -119,6 +141,7 @@ namespace AuthForge
                     return;
                 }
 
+                _heartbeatStop = false;
                 _heartbeatStarted = true;
                 _heartbeatThread = new Thread(HeartbeatLoop)
                 {
@@ -134,6 +157,13 @@ namespace AuthForge
             while (true)
             {
                 Thread.Sleep(TimeSpan.FromSeconds(HeartbeatInterval));
+                lock (_lock)
+                {
+                    if (_heartbeatStop)
+                    {
+                        break;
+                    }
+                }
                 try
                 {
                     if (HeartbeatMode == "SERVER")
@@ -168,16 +198,16 @@ namespace AuthForge
                 throw new InvalidOperationException("missing_session_token");
             }
 
-            var nonce = GenerateNonce();
             var body = new Dictionary<string, object?>
             {
                 ["appId"] = AppId,
                 ["sessionToken"] = sessionToken,
-                ["nonce"] = nonce,
+                ["nonce"] = GenerateNonce(),
                 ["hwid"] = hwid,
             };
             var responseObj = PostJson("/auth/heartbeat", body);
-            ApplySignedResponse(responseObj, nonce, null);
+            var expectedNonce = body.TryGetValue("nonce", out var usedNonce) ? (usedNonce?.ToString() ?? string.Empty) : string.Empty;
+            ApplySignedResponse(responseObj, expectedNonce, null);
         }
 
         private void LocalHeartbeat()
@@ -186,7 +216,6 @@ namespace AuthForge
             string? signature;
             byte[]? derivedKey;
             long? expiresIn;
-            string? licenseKey;
 
             lock (_lock)
             {
@@ -194,7 +223,6 @@ namespace AuthForge
                 signature = _signature;
                 derivedKey = _derivedKey;
                 expiresIn = _sessionExpiresIn;
-                licenseKey = _licenseKey;
             }
 
             if (string.IsNullOrEmpty(rawPayloadB64) || string.IsNullOrEmpty(signature) || derivedKey is null)
@@ -214,28 +242,22 @@ namespace AuthForge
             {
                 return;
             }
-
-            if (string.IsNullOrEmpty(licenseKey))
-            {
-                throw new InvalidOperationException("missing_license_key_for_refresh");
-            }
-
-            ValidateAndStore(licenseKey);
+            throw new InvalidOperationException("session_expired");
         }
 
         private void ValidateAndStore(string licenseKey)
         {
-            var nonce = GenerateNonce();
             var body = new Dictionary<string, object?>
             {
                 ["appId"] = AppId,
                 ["appSecret"] = AppSecret,
                 ["licenseKey"] = licenseKey,
                 ["hwid"] = _hwid,
-                ["nonce"] = nonce,
+                ["nonce"] = GenerateNonce(),
             };
             var responseObj = PostJson("/auth/validate", body);
-            ApplySignedResponse(responseObj, nonce, licenseKey);
+            var expectedNonce = body.TryGetValue("nonce", out var usedNonce) ? (usedNonce?.ToString() ?? string.Empty) : string.Empty;
+            ApplySignedResponse(responseObj, expectedNonce, licenseKey);
         }
 
         private void ApplySignedResponse(
@@ -246,15 +268,7 @@ namespace AuthForge
             responseObj.TryGetValue("status", out var statusElement);
             if (!IsSuccessStatus(statusElement))
             {
-                var statusText = statusElement.ValueKind == JsonValueKind.Undefined
-                    ? "None"
-                    : (statusElement.ToString() ?? string.Empty);
-                if (statusElement.ValueKind == JsonValueKind.String)
-                {
-                    statusText = $"'{statusText}'";
-                }
-
-                throw new ArgumentException($"auth_status_not_success: {statusText}");
+                throw new ArgumentException(ExtractServerError(responseObj));
             }
 
             var rawPayloadB64 = RequireStr(responseObj, "payload");
@@ -306,41 +320,80 @@ namespace AuthForge
                 _rawPayloadB64 = rawPayloadB64;
                 _signature = signature;
                 _derivedKey = derivedKey;
+                _sessionData = ConvertToObjectMap(payloadJson);
+                _appVariables = payloadJson.TryGetValue("appVariables", out var appVarsElement)
+                    ? ConvertJsonElementObject(appVarsElement)
+                    : null;
+                _licenseVariables = payloadJson.TryGetValue("licenseVariables", out var licenseVarsElement)
+                    ? ConvertJsonElementObject(licenseVarsElement)
+                    : null;
+                _authenticated = true;
             }
         }
 
         private Dictionary<string, JsonElement> PostJson(string path, Dictionary<string, object?> data)
         {
             var url = $"{ApiBaseUrl}{path}";
-            var payloadBytes = JsonSerializer.SerializeToUtf8Bytes(data, CompactJsonOptions);
-            using var request = new HttpRequestMessage(HttpMethod.Post, url)
-            {
-                Content = new ByteArrayContent(payloadBytes),
-            };
-            request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+            var body = new Dictionary<string, object?>(data, StringComparer.Ordinal);
+            var rateRetryDelays = new[] { 2, 5 };
+            var networkRetried = false;
+            var rateAttempt = 0;
 
-            HttpResponseMessage response;
-            string rawResponse;
-            try
+            while (true)
             {
-                response = _httpClient.Send(request);
-                rawResponse = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new InvalidOperationException($"url_error: {ex.Message}", ex);
-            }
-            catch (TaskCanceledException ex)
-            {
-                throw new InvalidOperationException($"url_error: {ex.Message}", ex);
-            }
+                if (rateAttempt > 0 && body.ContainsKey("nonce"))
+                {
+                    body["nonce"] = GenerateNonce();
+                    data["nonce"] = body["nonce"];
+                }
 
-            if (!response.IsSuccessStatusCode)
-            {
-                var statusCode = (int)response.StatusCode;
-                throw new InvalidOperationException($"http_error_{statusCode}: {rawResponse}");
-            }
+                var payloadBytes = JsonSerializer.SerializeToUtf8Bytes(body, CompactJsonOptions);
+                using var request = new HttpRequestMessage(HttpMethod.Post, url)
+                {
+                    Content = new ByteArrayContent(payloadBytes),
+                };
+                request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
 
+                try
+                {
+                    using var response = _httpClient.Send(request);
+                    var rawResponse = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    var parsed = ParseResponseObject(rawResponse);
+                    if (ExtractServerError(parsed) == "rate_limited" && rateAttempt < rateRetryDelays.Length)
+                    {
+                        Thread.Sleep(TimeSpan.FromSeconds(rateRetryDelays[rateAttempt]));
+                        rateAttempt++;
+                        continue;
+                    }
+                    return parsed;
+                }
+                catch (HttpRequestException ex)
+                {
+                    if (!networkRetried)
+                    {
+                        networkRetried = true;
+                        Thread.Sleep(TimeSpan.FromSeconds(2));
+                        continue;
+                    }
+                    Fail("network_error", ex);
+                    throw new InvalidOperationException($"url_error: {ex.Message}", ex);
+                }
+                catch (TaskCanceledException ex)
+                {
+                    if (!networkRetried)
+                    {
+                        networkRetried = true;
+                        Thread.Sleep(TimeSpan.FromSeconds(2));
+                        continue;
+                    }
+                    Fail("network_error", ex);
+                    throw new InvalidOperationException($"url_error: {ex.Message}", ex);
+                }
+            }
+        }
+
+        private static Dictionary<string, JsonElement> ParseResponseObject(string rawResponse)
+        {
             JsonDocument document;
             try
             {
@@ -655,6 +708,82 @@ namespace AuthForge
             Environment.Exit(1);
         }
 
+        private string ExtractServerError(Dictionary<string, JsonElement> responseObj)
+        {
+            if (responseObj.TryGetValue("error", out var errorElement))
+            {
+                var error = (errorElement.ToString() ?? string.Empty).Trim().ToLowerInvariant();
+                if (_knownServerErrors.Contains(error))
+                {
+                    return error;
+                }
+            }
+
+            if (responseObj.TryGetValue("status", out var statusElement))
+            {
+                var status = (statusElement.ToString() ?? string.Empty).Trim().ToLowerInvariant();
+                if (_knownServerErrors.Contains(status))
+                {
+                    return status;
+                }
+            }
+
+            return "unknown_error";
+        }
+
+        public void Logout()
+        {
+            lock (_lock)
+            {
+                _heartbeatStop = true;
+                _heartbeatStarted = false;
+                _heartbeatThread = null;
+                _licenseKey = null;
+                _sessionToken = null;
+                _sessionExpiresIn = null;
+                _lastNonce = null;
+                _rawPayloadB64 = null;
+                _signature = null;
+                _derivedKey = null;
+                _sessionData = null;
+                _appVariables = null;
+                _licenseVariables = null;
+                _authenticated = false;
+            }
+        }
+
+        public bool IsAuthenticated()
+        {
+            lock (_lock)
+            {
+                return _authenticated && !string.IsNullOrEmpty(_sessionToken);
+            }
+        }
+
+        public Dictionary<string, object?>? GetSessionData()
+        {
+            lock (_lock)
+            {
+                return _sessionData is null ? null : new Dictionary<string, object?>(_sessionData, StringComparer.Ordinal);
+            }
+        }
+
+        public Dictionary<string, object?>? GetAppVariables()
+        {
+            lock (_lock)
+            {
+                return _appVariables is null ? null : new Dictionary<string, object?>(_appVariables, StringComparer.Ordinal);
+            }
+        }
+
+        public Dictionary<string, object?>? GetLicenseVariables()
+        {
+            lock (_lock)
+            {
+                return _licenseVariables is null ? null : new Dictionary<string, object?>(_licenseVariables, StringComparer.Ordinal);
+            }
+        }
+
         private static long ConvertToInt64(JsonElement element)
         {
             if (element.ValueKind == JsonValueKind.Number && element.TryGetInt64(out var int64Value))
@@ -674,6 +803,26 @@ namespace AuthForge
         private static string ToHexLower(byte[] bytes)
         {
             return Convert.ToHexString(bytes).ToLowerInvariant();
+        }
+
+        private static Dictionary<string, object?>? ConvertJsonElementObject(JsonElement element)
+        {
+            if (element.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            return JsonSerializer.Deserialize<Dictionary<string, object?>>(element.GetRawText());
+        }
+
+        private static Dictionary<string, object?> ConvertToObjectMap(Dictionary<string, JsonElement> source)
+        {
+            var result = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var entry in source)
+            {
+                result[entry.Key] = JsonSerializer.Deserialize<object?>(entry.Value.GetRawText());
+            }
+            return result;
         }
     }
 }

@@ -11,8 +11,11 @@ namespace AuthForge
     public static class GenerateVectors
     {
         private const string AppSecret = "af_test_secret_2026_reference";
+        private const string SigKey = "af_test_sig_key_2026_reference_0123456789abcdef";
         private const string Nonce = "0123456789abcdeffedcba9876543210";
         private const string SessionSigningSecret = "authforge-dev-session-signing-secret-rotate-before-production";
+        private const long ExpiresIn = 1740433200L;
+        private const long Timestamp = 1740429600L;
         private static readonly JsonSerializerOptions CompactJsonOptions = new JsonSerializerOptions
         {
             Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
@@ -23,15 +26,15 @@ namespace AuthForge
             return Convert.ToBase64String(data).TrimEnd('=').Replace('+', '-').Replace('/', '_');
         }
 
-        private static string BuildRealisticSessionToken()
+        private static string BuildSessionToken()
         {
             var body = new Dictionary<string, object?>
             {
                 ["appId"] = "test-app",
                 ["licenseKey"] = "test-key",
                 ["hwid"] = "testhwid",
-                ["appSecret"] = AppSecret,
-                ["expiresIn"] = 1740433200,
+                ["sigKey"] = SigKey,
+                ["expiresIn"] = ExpiresIn,
             };
 
             var bodyJson = JsonSerializer.Serialize(body, CompactJsonOptions);
@@ -51,9 +54,9 @@ namespace AuthForge
         {
             var payloadObj = new Dictionary<string, object?>
             {
-                ["sessionToken"] = BuildRealisticSessionToken(),
-                ["timestamp"] = 1740429600,
-                ["expiresIn"] = 1740433200,
+                ["sessionToken"] = BuildSessionToken(),
+                ["timestamp"] = Timestamp,
+                ["expiresIn"] = ExpiresIn,
                 ["nonce"] = Nonce,
             };
 
@@ -61,36 +64,62 @@ namespace AuthForge
             return Convert.ToBase64String(Encoding.UTF8.GetBytes(payloadJson));
         }
 
+        private static string SignHex(byte[] key, string message)
+        {
+            using var hmac = new HMACSHA256(key);
+            var bytes = hmac.ComputeHash(Encoding.UTF8.GetBytes(message));
+            return Convert.ToHexString(bytes).ToLowerInvariant();
+        }
+
         public static void Main()
         {
             var payload = BuildPayloadB64();
 
-            var derivedKeyBytes = SHA256.HashData(Encoding.UTF8.GetBytes($"{AppSecret}{Nonce}"));
+            var validateKey = SHA256.HashData(Encoding.UTF8.GetBytes($"{AppSecret}{Nonce}"));
+            var validateSig = SignHex(validateKey, payload);
 
-            string signatureHex;
-            using (var hmac = new HMACSHA256(derivedKeyBytes))
-            {
-                var signatureBytes = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-                signatureHex = Convert.ToHexString(signatureBytes).ToLowerInvariant();
-            }
+            var heartbeatKey = SHA256.HashData(Encoding.UTF8.GetBytes($"{SigKey}{Nonce}"));
+            var heartbeatSig = SignHex(heartbeatKey, payload);
 
             var vectors = new Dictionary<string, object?>
             {
-                ["algorithm"] = new Dictionary<string, object?>
+                ["validate"] = new Dictionary<string, object?>
                 {
-                    ["keyDerivation"] = "SHA256(appSecret + nonce)",
-                    ["signature"] = "HMAC-SHA256(raw_base64_payload_string, derivedKey)",
+                    ["algorithm"] = new Dictionary<string, object?>
+                    {
+                        ["keyDerivation"] = "SHA256(appSecret + nonce)",
+                        ["signature"] = "HMAC-SHA256(raw_base64_payload_string, derivedKey)",
+                    },
+                    ["inputs"] = new Dictionary<string, object?>
+                    {
+                        ["appSecret"] = AppSecret,
+                        ["nonce"] = Nonce,
+                        ["payload"] = payload,
+                    },
+                    ["outputs"] = new Dictionary<string, object?>
+                    {
+                        ["derivedKeyHex"] = Convert.ToHexString(validateKey).ToLowerInvariant(),
+                        ["signatureHex"] = validateSig,
+                    },
                 },
-                ["inputs"] = new Dictionary<string, object?>
+                ["heartbeat"] = new Dictionary<string, object?>
                 {
-                    ["appSecret"] = AppSecret,
-                    ["nonce"] = Nonce,
-                    ["payload"] = payload,
-                },
-                ["outputs"] = new Dictionary<string, object?>
-                {
-                    ["derivedKeyHex"] = Convert.ToHexString(derivedKeyBytes).ToLowerInvariant(),
-                    ["signatureHex"] = signatureHex,
+                    ["algorithm"] = new Dictionary<string, object?>
+                    {
+                        ["keyDerivation"] = "SHA256(sigKey + nonce)",
+                        ["signature"] = "HMAC-SHA256(raw_base64_payload_string, derivedKey)",
+                    },
+                    ["inputs"] = new Dictionary<string, object?>
+                    {
+                        ["sigKey"] = SigKey,
+                        ["nonce"] = Nonce,
+                        ["payload"] = payload,
+                    },
+                    ["outputs"] = new Dictionary<string, object?>
+                    {
+                        ["derivedKeyHex"] = Convert.ToHexString(heartbeatKey).ToLowerInvariant(),
+                        ["signatureHex"] = heartbeatSig,
+                    },
                 },
             };
 

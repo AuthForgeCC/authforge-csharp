@@ -39,6 +39,7 @@ namespace AuthForge
             "app_disabled",
             "session_expired",
             "bad_request",
+            "server_error",
             "checksum_required",
             "checksum_mismatch",
         };
@@ -54,6 +55,7 @@ namespace AuthForge
         private string? _rawPayloadB64;
         private string? _signature;
         private byte[]? _derivedKey;
+        private string? _sigKey;
         private Dictionary<string, object?>? _sessionData;
         private Dictionary<string, object?>? _appVariables;
         private Dictionary<string, object?>? _licenseVariables;
@@ -207,7 +209,7 @@ namespace AuthForge
             };
             var responseObj = PostJson("/auth/heartbeat", body);
             var expectedNonce = body.TryGetValue("nonce", out var usedNonce) ? (usedNonce?.ToString() ?? string.Empty) : string.Empty;
-            ApplySignedResponse(responseObj, expectedNonce, null);
+            ApplySignedResponse(responseObj, expectedNonce, null, "heartbeat");
         }
 
         private void LocalHeartbeat()
@@ -257,13 +259,14 @@ namespace AuthForge
             };
             var responseObj = PostJson("/auth/validate", body);
             var expectedNonce = body.TryGetValue("nonce", out var usedNonce) ? (usedNonce?.ToString() ?? string.Empty) : string.Empty;
-            ApplySignedResponse(responseObj, expectedNonce, licenseKey);
+            ApplySignedResponse(responseObj, expectedNonce, licenseKey, "validate");
         }
 
         private void ApplySignedResponse(
             Dictionary<string, JsonElement> responseObj,
             string expectedNonce,
-            string? licenseKey)
+            string? licenseKey,
+            string context)
         {
             responseObj.TryGetValue("status", out var statusElement);
             if (!IsSuccessStatus(statusElement))
@@ -283,7 +286,12 @@ namespace AuthForge
                 throw new ArgumentException("nonce_mismatch");
             }
 
-            var derivedKey = DeriveKey(expectedNonce);
+            byte[] derivedKey = context switch
+            {
+                "validate" => DeriveValidateKey(expectedNonce),
+                "heartbeat" => DeriveHeartbeatKey(expectedNonce),
+                _ => throw new ArgumentException($"unknown_signing_context:{context}"),
+            };
             VerifySignature(rawPayloadB64, derivedKey, signature);
 
             var sessionToken = payloadJson.TryGetValue("sessionToken", out var sessionTokenElement)
@@ -292,6 +300,12 @@ namespace AuthForge
             if (string.IsNullOrEmpty(sessionToken))
             {
                 throw new ArgumentException("missing_sessionToken");
+            }
+
+            var newSigKey = ExtractSigKeyFromSessionToken(sessionToken);
+            if (string.IsNullOrEmpty(newSigKey))
+            {
+                throw new ArgumentException("missing_sigKey");
             }
 
             var expiresFromToken = ExtractExpiresInFromSessionToken(sessionToken);
@@ -320,6 +334,7 @@ namespace AuthForge
                 _rawPayloadB64 = rawPayloadB64;
                 _signature = signature;
                 _derivedKey = derivedKey;
+                _sigKey = newSigKey;
                 _sessionData = ConvertToObjectMap(payloadJson);
                 _appVariables = payloadJson.TryGetValue("appVariables", out var appVarsElement)
                     ? ConvertJsonElementObject(appVarsElement)
@@ -357,9 +372,23 @@ namespace AuthForge
                 try
                 {
                     using var response = _httpClient.Send(request);
+                    var statusCode = (int)response.StatusCode;
                     var rawResponse = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                    var parsed = ParseResponseObject(rawResponse);
-                    if (ExtractServerError(parsed) == "rate_limited" && rateAttempt < rateRetryDelays.Length)
+                    Dictionary<string, JsonElement> parsed;
+                    try
+                    {
+                        parsed = ParseResponseObject(rawResponse);
+                    }
+                    catch
+                    {
+                        if (statusCode >= 400)
+                        {
+                            throw new InvalidOperationException($"http_error_{statusCode}");
+                        }
+                        throw;
+                    }
+                    var isRateLimited = statusCode == 429 || ExtractServerError(parsed) == "rate_limited";
+                    if (isRateLimited && rateAttempt < rateRetryDelays.Length)
                     {
                         Thread.Sleep(TimeSpan.FromSeconds(rateRetryDelays[rateAttempt]));
                         rateAttempt++;
@@ -587,7 +616,7 @@ namespace AuthForge
             }
         }
 
-        private static long? ExtractExpiresInFromSessionToken(string sessionToken)
+        private static JsonDocument? TryDecodeSessionTokenBody(string sessionToken)
         {
             var parts = sessionToken.Split('.');
             if (parts.Length < 2)
@@ -595,29 +624,68 @@ namespace AuthForge
                 return null;
             }
 
-            var payloadPart = parts[0];
-            var padded = AddBase64Padding(payloadPart);
+            var padded = AddBase64Padding(parts[0]);
             try
             {
                 var normalized = padded.Replace('-', '+').Replace('_', '/');
                 var decoded = Convert.FromBase64String(normalized);
-                using var payloadDoc = JsonDocument.Parse(decoded);
-                if (payloadDoc.RootElement.ValueKind != JsonValueKind.Object)
+                var doc = JsonDocument.Parse(decoded);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
                 {
+                    doc.Dispose();
                     return null;
                 }
+                return doc;
+            }
+            catch
+            {
+                return null;
+            }
+        }
 
-                if (!payloadDoc.RootElement.TryGetProperty("expiresIn", out var expiresInElement))
-                {
-                    return null;
-                }
+        private static long? ExtractExpiresInFromSessionToken(string sessionToken)
+        {
+            using var doc = TryDecodeSessionTokenBody(sessionToken);
+            if (doc is null)
+            {
+                return null;
+            }
 
+            if (!doc.RootElement.TryGetProperty("expiresIn", out var expiresInElement))
+            {
+                return null;
+            }
+
+            try
+            {
                 return ConvertToInt64(expiresInElement);
             }
             catch
             {
                 return null;
             }
+        }
+
+        private static string? ExtractSigKeyFromSessionToken(string sessionToken)
+        {
+            using var doc = TryDecodeSessionTokenBody(sessionToken);
+            if (doc is null)
+            {
+                return null;
+            }
+
+            if (!doc.RootElement.TryGetProperty("sigKey", out var sigKeyElement))
+            {
+                return null;
+            }
+
+            if (sigKeyElement.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+
+            var value = sigKeyElement.GetString();
+            return string.IsNullOrEmpty(value) ? null : value;
         }
 
         private static string AddBase64Padding(string text)
@@ -631,9 +699,24 @@ namespace AuthForge
             return text + new string('=', 4 - remainder);
         }
 
-        private byte[] DeriveKey(string nonce)
+        internal byte[] DeriveValidateKey(string nonce)
         {
             var seed = Encoding.UTF8.GetBytes($"{AppSecret}{nonce}");
+            return SHA256.HashData(seed);
+        }
+
+        internal byte[] DeriveHeartbeatKey(string nonce)
+        {
+            string? sigKey;
+            lock (_lock)
+            {
+                sigKey = _sigKey;
+            }
+            if (string.IsNullOrEmpty(sigKey))
+            {
+                throw new InvalidOperationException("missing_sig_key");
+            }
+            var seed = Encoding.UTF8.GetBytes($"{sigKey}{nonce}");
             return SHA256.HashData(seed);
         }
 
@@ -745,6 +828,7 @@ namespace AuthForge
                 _rawPayloadB64 = null;
                 _signature = null;
                 _derivedKey = null;
+                _sigKey = null;
                 _sessionData = null;
                 _appVariables = null;
                 _licenseVariables = null;

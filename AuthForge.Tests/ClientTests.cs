@@ -6,6 +6,7 @@ namespace AuthForge.Tests;
 public class ClientTests
 {
     private static readonly BindingFlags StaticNonPublic = BindingFlags.Static | BindingFlags.NonPublic;
+    private const string TestPublicKey = "0wRcYWn44wk9tHOisXgso1wbtUqpFdy0IeMk4HXDiNc=";
 
     [Fact]
     public void IsAuthenticated_IsFalse_BeforeLogin()
@@ -13,6 +14,7 @@ public class ClientTests
         var client = new AuthForgeClient(
             "test-app",
             "test-secret",
+            TestPublicKey,
             "LOCAL",
             heartbeatInterval: 3600,
             apiBaseUrl: "http://127.0.0.1");
@@ -27,7 +29,7 @@ public class ClientTests
     public void Constructor_RejectsInvalidHeartbeatMode(string mode)
     {
         var ex = Assert.Throws<ArgumentException>(() =>
-            new AuthForgeClient("a", "b", mode, 900, apiBaseUrl: "http://127.0.0.1"));
+            new AuthForgeClient("a", "b", TestPublicKey, mode, 900, apiBaseUrl: "http://127.0.0.1"));
         Assert.Equal("heartbeatMode", ex.ParamName);
     }
 

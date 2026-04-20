@@ -12,6 +12,8 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Crypto.Signers;
 
 namespace AuthForge
 {
@@ -33,6 +35,7 @@ namespace AuthForge
             "revoked",
             "hwid_mismatch",
             "no_credits",
+            "app_burn_cap_reached",
             "blocked",
             "rate_limited",
             "replay_detected",
@@ -40,8 +43,7 @@ namespace AuthForge
             "session_expired",
             "bad_request",
             "server_error",
-            "checksum_required",
-            "checksum_mismatch",
+            "system_error",
         };
 
         private Thread? _heartbeatThread;
@@ -54,8 +56,7 @@ namespace AuthForge
         private string? _lastNonce;
         private string? _rawPayloadB64;
         private string? _signature;
-        private byte[]? _derivedKey;
-        private string? _sigKey;
+        private string? _keyId;
         private Dictionary<string, object?>? _sessionData;
         private Dictionary<string, object?>? _appVariables;
         private Dictionary<string, object?>? _licenseVariables;
@@ -64,15 +65,19 @@ namespace AuthForge
 
         public string AppId { get; }
         public string AppSecret { get; }
+        public string PublicKey { get; }
         public string HeartbeatMode { get; }
         public int HeartbeatInterval { get; }
         public string ApiBaseUrl { get; }
         public Action<string, Exception?>? OnFailure { get; }
         public int RequestTimeout { get; }
 
+        private readonly Ed25519PublicKeyParameters _verifyPublicKey;
+
         public AuthForgeClient(
             string appId,
             string appSecret,
+            string publicKey,
             string heartbeatMode,
             int heartbeatInterval = 900,
             string apiBaseUrl = DefaultApiBaseUrl,
@@ -88,6 +93,10 @@ namespace AuthForge
             {
                 throw new ArgumentException("app_secret must be a non-empty string", nameof(appSecret));
             }
+            if (string.IsNullOrEmpty(publicKey))
+            {
+                throw new ArgumentException("public_key must be a non-empty string", nameof(publicKey));
+            }
 
             var mode = (heartbeatMode ?? string.Empty).ToUpperInvariant();
             if (mode != "LOCAL" && mode != "SERVER")
@@ -102,6 +111,7 @@ namespace AuthForge
 
             AppId = appId;
             AppSecret = appSecret;
+            PublicKey = publicKey;
             HeartbeatMode = mode;
             HeartbeatInterval = heartbeatInterval;
             ApiBaseUrl = (apiBaseUrl ?? string.Empty).TrimEnd('/');
@@ -111,6 +121,20 @@ namespace AuthForge
             {
                 Timeout = TimeSpan.FromSeconds(RequestTimeout),
             };
+            byte[] publicKeyBytes;
+            try
+            {
+                publicKeyBytes = Convert.FromBase64String(publicKey);
+            }
+            catch (FormatException ex)
+            {
+                throw new ArgumentException("public_key must be valid base64", nameof(publicKey), ex);
+            }
+            if (publicKeyBytes.Length != 32)
+            {
+                throw new ArgumentException("public_key must be 32 bytes (base64 Ed25519 raw key)", nameof(publicKey));
+            }
+            _verifyPublicKey = new Ed25519PublicKeyParameters(publicKeyBytes, 0);
             _hwid = GetHwid();
         }
 
@@ -216,23 +240,21 @@ namespace AuthForge
         {
             string? rawPayloadB64;
             string? signature;
-            byte[]? derivedKey;
             long? expiresIn;
 
             lock (_lock)
             {
                 rawPayloadB64 = _rawPayloadB64;
                 signature = _signature;
-                derivedKey = _derivedKey;
                 expiresIn = _sessionExpiresIn;
             }
 
-            if (string.IsNullOrEmpty(rawPayloadB64) || string.IsNullOrEmpty(signature) || derivedKey is null)
+            if (string.IsNullOrEmpty(rawPayloadB64) || string.IsNullOrEmpty(signature))
             {
                 throw new InvalidOperationException("missing_local_verification_state");
             }
 
-            VerifySignature(rawPayloadB64, derivedKey, signature);
+            VerifySignature(rawPayloadB64, signature);
 
             if (expiresIn is null)
             {
@@ -286,13 +308,8 @@ namespace AuthForge
                 throw new ArgumentException("nonce_mismatch");
             }
 
-            byte[] derivedKey = context switch
-            {
-                "validate" => DeriveValidateKey(expectedNonce),
-                "heartbeat" => DeriveHeartbeatKey(expectedNonce),
-                _ => throw new ArgumentException($"unknown_signing_context:{context}"),
-            };
-            VerifySignature(rawPayloadB64, derivedKey, signature);
+            _ = context;
+            VerifySignature(rawPayloadB64, signature);
 
             var sessionToken = payloadJson.TryGetValue("sessionToken", out var sessionTokenElement)
                 ? (sessionTokenElement.ToString() ?? string.Empty).Trim()
@@ -300,12 +317,6 @@ namespace AuthForge
             if (string.IsNullOrEmpty(sessionToken))
             {
                 throw new ArgumentException("missing_sessionToken");
-            }
-
-            var newSigKey = ExtractSigKeyFromSessionToken(sessionToken);
-            if (string.IsNullOrEmpty(newSigKey))
-            {
-                throw new ArgumentException("missing_sigKey");
             }
 
             var expiresFromToken = ExtractExpiresInFromSessionToken(sessionToken);
@@ -333,8 +344,7 @@ namespace AuthForge
                 _lastNonce = expectedNonce;
                 _rawPayloadB64 = rawPayloadB64;
                 _signature = signature;
-                _derivedKey = derivedKey;
-                _sigKey = newSigKey;
+                _keyId = responseObj.TryGetValue("keyId", out var keyIdElement) ? keyIdElement.ToString() : null;
                 _sessionData = ConvertToObjectMap(payloadJson);
                 _appVariables = payloadJson.TryGetValue("appVariables", out var appVarsElement)
                     ? ConvertJsonElementObject(appVarsElement)
@@ -651,7 +661,7 @@ namespace AuthForge
                 return null;
             }
 
-            if (!doc.RootElement.TryGetProperty("expiresIn", out var expiresInElement))
+            if (!doc.RootElement.TryGetProperty("exp", out var expiresInElement))
             {
                 return null;
             }
@@ -666,28 +676,6 @@ namespace AuthForge
             }
         }
 
-        private static string? ExtractSigKeyFromSessionToken(string sessionToken)
-        {
-            using var doc = TryDecodeSessionTokenBody(sessionToken);
-            if (doc is null)
-            {
-                return null;
-            }
-
-            if (!doc.RootElement.TryGetProperty("sigKey", out var sigKeyElement))
-            {
-                return null;
-            }
-
-            if (sigKeyElement.ValueKind != JsonValueKind.String)
-            {
-                return null;
-            }
-
-            var value = sigKeyElement.GetString();
-            return string.IsNullOrEmpty(value) ? null : value;
-        }
-
         private static string AddBase64Padding(string text)
         {
             var remainder = text.Length % 4;
@@ -699,36 +687,23 @@ namespace AuthForge
             return text + new string('=', 4 - remainder);
         }
 
-        internal byte[] DeriveValidateKey(string nonce)
+        private void VerifySignature(string rawPayloadB64, string signature)
         {
-            var seed = Encoding.UTF8.GetBytes($"{AppSecret}{nonce}");
-            return SHA256.HashData(seed);
-        }
-
-        internal byte[] DeriveHeartbeatKey(string nonce)
-        {
-            string? sigKey;
-            lock (_lock)
+            byte[] signatureBytes;
+            try
             {
-                sigKey = _sigKey;
+                signatureBytes = Convert.FromBase64String(signature);
             }
-            if (string.IsNullOrEmpty(sigKey))
+            catch (FormatException ex)
             {
-                throw new InvalidOperationException("missing_sig_key");
+                throw new ArgumentException("invalid_signature", ex);
             }
-            var seed = Encoding.UTF8.GetBytes($"{sigKey}{nonce}");
-            return SHA256.HashData(seed);
-        }
 
-        private static void VerifySignature(string rawPayloadB64, byte[] derivedKey, string signature)
-        {
-            using var hmac = new HMACSHA256(derivedKey);
-            var expectedBytes = hmac.ComputeHash(Encoding.UTF8.GetBytes(rawPayloadB64));
-            var expected = ToHexLower(expectedBytes);
-            var received = (signature ?? string.Empty).Trim().ToLowerInvariant();
-            if (!CryptographicOperations.FixedTimeEquals(
-                    Encoding.ASCII.GetBytes(expected),
-                    Encoding.ASCII.GetBytes(received)))
+            var verifier = new Ed25519Signer();
+            verifier.Init(forSigning: false, _verifyPublicKey);
+            var payloadBytes = Encoding.UTF8.GetBytes(rawPayloadB64);
+            verifier.BlockUpdate(payloadBytes, 0, payloadBytes.Length);
+            if (!verifier.VerifySignature(signatureBytes))
             {
                 throw new ArgumentException("signature_mismatch");
             }
@@ -827,8 +802,7 @@ namespace AuthForge
                 _lastNonce = null;
                 _rawPayloadB64 = null;
                 _signature = null;
-                _derivedKey = null;
-                _sigKey = null;
+                _keyId = null;
                 _sessionData = null;
                 _appVariables = null;
                 _licenseVariables = null;

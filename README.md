@@ -1,8 +1,8 @@
 # AuthForge C# SDK
 
-Official C# SDK for [AuthForge](https://authforge.cc) — credit-based license key authentication with HMAC-verified heartbeats.
+Official C# SDK for [AuthForge](https://authforge.cc) — credit-based license key authentication with Ed25519-verified responses.
 
-**Zero external dependencies.** Standard library only (`System.Net.Http`, `System.Security.Cryptography`, `System.Text.Json`). Targets .NET 6+.
+Dependencies: `BouncyCastle.Cryptography` for Ed25519 verification. Targets .NET 6+.
 
 ## Quick Start
 
@@ -14,6 +14,7 @@ using AuthForge;
 var client = new AuthForgeClient(
     appId: "YOUR_APP_ID",           // from your AuthForge dashboard
     appSecret: "YOUR_APP_SECRET",   // from your AuthForge dashboard
+    publicKey: "YOUR_PUBLIC_KEY",   // base64 Ed25519 public key from dashboard
     heartbeatMode: "SERVER"         // "SERVER" or "LOCAL"
 );
 
@@ -38,6 +39,7 @@ else
 |---|---|---|---|
 | `appId` | string | required | Your application ID from the AuthForge dashboard |
 | `appSecret` | string | required | Your application secret from the AuthForge dashboard |
+| `publicKey` | string | required | App Ed25519 public key (base64) from dashboard |
 | `heartbeatMode` | string | required | `"SERVER"` or `"LOCAL"` (see below) |
 | `heartbeatInterval` | int | `900` | Seconds between heartbeat checks (default 15 min) |
 | `apiBaseUrl` | string | `https://auth.authforge.cc` | API endpoint |
@@ -66,7 +68,7 @@ else
 If authentication fails, the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `Environment.Exit(1)` to terminate the process.** This is intentional — it prevents your app from running without a valid license.
 
 Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`, `checksum_required`, `checksum_mismatch`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`
 
 Request retries are automatic inside the internal HTTP layer:
 - `rate_limited`: retry after 2s, then 5s (max 3 attempts total)
@@ -77,6 +79,7 @@ Request retries are automatic inside the internal HTTP layer:
 var client = new AuthForgeClient(
     appId: "YOUR_APP_ID",
     appSecret: "YOUR_APP_SECRET",
+    publicKey: "YOUR_PUBLIC_KEY",
     heartbeatMode: "SERVER",
     onFailure: (reason, exception) =>
     {
@@ -90,20 +93,20 @@ var client = new AuthForgeClient(
 
 ## How It Works
 
-1. **Login** — Collects a hardware fingerprint (MAC, CPU, disk serial), generates a random nonce, and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the HMAC-SHA256 signature and nonce to prevent replay attacks.
+1. **Login** — Collects a hardware fingerprint (MAC, CPU, disk serial), generates a random nonce, and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
 
 2. **Heartbeat** — A background thread checks in at the configured interval. In SERVER mode, it sends a fresh nonce and verifies the response. In LOCAL mode, it re-verifies the stored signature and checks expiry without network calls.
 
-3. **Crypto** — The `/validate` response is signed with a key derived from `SHA256(appSecret + nonce)`. That response carries a per-session `sigKey` (32-byte random hex) embedded in the signed session token. Every `/heartbeat` response is then signed with a key derived from `SHA256(sigKey + nonce)`. This keeps `appSecret` out of the heartbeat path while still rotating the signing key on every nonce, making replay and MITM attacks impractical.
+3. **Crypto** — Both `/validate` and `/heartbeat` responses are signed by AuthForge with your app's Ed25519 private key. The SDK verifies every signed `payload` using your configured `publicKey` and rejects tampered responses.
 
 ## Test Vectors
 
-The `GenerateVectors.cs` script and `test_vectors.json` file are provided for cross-SDK verification. This SDK produces identical cryptographic outputs to the Python and C++ reference implementations.
+The `test_vectors.json` file is shared across all SDKs and validates cross-language Ed25519 verification behavior.
 
 ## Requirements
 
 - .NET 6+
-- No NuGet packages
+- NuGet package: `BouncyCastle.Cryptography`
 
 ## License
 

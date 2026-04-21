@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net6.0</TargetFrameworks>
+    <AssemblyName>AuthForge</AssemblyName>
+    <RootNamespace>AuthForge</RootNamespace>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageId>AuthForge</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>AuthForge</Authors>
+    <Description>Official AuthForge SDK for .NET — credit-based license key authentication with Ed25519-verified responses.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://authforge.cc</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/AuthForgeCC/authforge-csharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>authforge;license;licensing;hwid;authentication</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <PackageReference Include="System.Text.Encodings.Web" Version="8.0.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="AuthForge.Tests/**" />
+    <None Remove="AuthForge.Tests/**" />
+    <EmbeddedResource Remove="AuthForge.Tests/**" />
+    <Compile Remove="GenerateVectors.cs" />
+  </ItemGroup>
+</Project>

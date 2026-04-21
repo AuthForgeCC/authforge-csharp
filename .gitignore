@@ -1,5 +1,15 @@
+# .NET build outputs
 bin/
 obj/
+dist/
 *.user
 *.suo
 .vs/
+
+# Published package output
+*.nupkg
+*.snupkg
+
+# Local secrets / user settings
+*.userprefs
+launchSettings.json

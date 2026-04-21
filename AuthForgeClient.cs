@@ -381,7 +381,7 @@ namespace AuthForge
 
                 try
                 {
-                    using var response = _httpClient.Send(request);
+                    using var response = _httpClient.SendAsync(request).GetAwaiter().GetResult();
                     var statusCode = (int)response.StatusCode;
                     var rawResponse = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
                     Dictionary<string, JsonElement> parsed;
@@ -466,7 +466,11 @@ namespace AuthForge
             var cpu = SafeCpuInfo();
             var disk = SafeDiskSerial();
             var material = $"mac:{mac}|cpu:{cpu}|disk:{disk}";
-            var hash = SHA256.HashData(Encoding.UTF8.GetBytes(material));
+            byte[] hash;
+            using (var sha256 = SHA256.Create())
+            {
+                hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(material));
+            }
             return ToHexLower(hash);
         }
 
@@ -479,7 +483,7 @@ namespace AuthForge
                     var bytes = networkInterface.GetPhysicalAddress().GetAddressBytes();
                     if (bytes.Length > 0)
                     {
-                        return BitConverter.ToString(bytes).Replace("-", string.Empty, StringComparison.Ordinal).ToLowerInvariant();
+                        return BitConverter.ToString(bytes).Replace("-", string.Empty).ToLowerInvariant();
                     }
                 }
 
@@ -562,7 +566,7 @@ namespace AuthForge
                 {
                     try
                     {
-                        process.Kill(entireProcessTree: true);
+                        process.Kill();
                     }
                     catch
                     {
@@ -574,7 +578,7 @@ namespace AuthForge
 
                 var output = process.StandardOutput.ReadToEnd();
                 var cleaned = string.Join(" ", (output ?? string.Empty).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-                return string.IsNullOrEmpty(cleaned) ? "empty" : (cleaned.Length > 256 ? cleaned[..256] : cleaned);
+                return string.IsNullOrEmpty(cleaned) ? "empty" : (cleaned.Length > 256 ? cleaned.Substring(0, 256) : cleaned);
             }
             catch
             {
@@ -712,8 +716,11 @@ namespace AuthForge
         private static string GenerateNonce()
         {
             var bytes = new byte[16];
-            RandomNumberGenerator.Fill(bytes);
-            return Convert.ToHexString(bytes).ToLowerInvariant();
+            using (var random = RandomNumberGenerator.Create())
+            {
+                random.GetBytes(bytes);
+            }
+            return ToHexStringCompat(bytes).ToLowerInvariant();
         }
 
         private static bool IsSuccessStatus(JsonElement status)
@@ -860,7 +867,12 @@ namespace AuthForge
 
         private static string ToHexLower(byte[] bytes)
         {
-            return Convert.ToHexString(bytes).ToLowerInvariant();
+            return ToHexStringCompat(bytes).ToLowerInvariant();
+        }
+
+        private static string ToHexStringCompat(byte[] bytes)
+        {
+            return BitConverter.ToString(bytes).Replace("-", string.Empty);
         }
 
         private static Dictionary<string, object?>? ConvertJsonElementObject(JsonElement element)

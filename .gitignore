@@ -13,3 +13,9 @@ dist/
 # Local secrets / user settings
 *.userprefs
 launchSettings.json
+
+# Test output
+TestResults/
+*.trx
+coverage*.json
+coverage*.xml

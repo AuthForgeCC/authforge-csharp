@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Verify tag matches csproj version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CSPROJ=$(grep -oPm1 "(?<=<Version>)[^<]+" AuthForge.csproj)
+          if [ "$TAG" != "$CSPROJ" ]; then
+            echo "Tag v$TAG does not match AuthForge.csproj version $CSPROJ"
+            exit 1
+          fi
+      - name: Test
+        run: dotnet test AuthForge.Tests/AuthForge.Tests.csproj -c Release
+      - name: Build and pack
+        run: dotnet pack AuthForge.csproj -c Release -o dist
+      - name: Log in to NuGet via Trusted Publishing
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: RAZKOM
+      - name: Push to NuGet
+        run: |
+          dotnet nuget push dist/*.nupkg \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }} \
+            --skip-duplicate

@@ -55,10 +55,18 @@ client.Logout();
 | `appId` | `string` | yes | — | Application ID |
 | `appSecret` | `string` | yes | — | Application secret |
 | `heartbeatMode` | `string` | yes | — | `"SERVER"` or `"LOCAL"` (case-insensitive) |
-| `heartbeatInterval` | `int` | no | `900` | Seconds between heartbeats |
+| `heartbeatInterval` | `int` | no | `900` | Seconds between heartbeats (any value ≥ 1 is supported; revocations apply on the next heartbeat) |
 | `apiBaseUrl` | `string` | no | `https://auth.authforge.cc` | API base URL |
 | `onFailure` | `Action<string, Exception?>?` | no | `null` | Called on failure; if null, `Environment.Exit(1)` |
 | `requestTimeout` | `int` | no | `15` | HTTP timeout (seconds) |
+| `ttlSeconds` | `int?` | no | `null` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
+
+## Billing model
+
+- `Login()` calls `/auth/validate` and costs **1 credit**.
+- Heartbeats cost **1 credit per 10 successful calls** (billed on every 10th heartbeat).
+- Heartbeat frequency is your choice: any interval ≥ 1 second is fine, because the cost is tied to how many heartbeats you send, not how often.
+- Revocations take effect on the **next** heartbeat regardless of interval.
 
 ## Methods
 
@@ -74,6 +82,9 @@ client.Logout();
 ## Error codes the server can return
 
 invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, blocked, rate_limited, replay_detected, session_expired, app_disabled, bad_request
+
+Notes:
+- `rate_limited` and `replay_detected` are only returned from `/auth/validate`. Heartbeats are not IP rate-limited and do not enforce nonce replay.
 
 ## Common patterns
 

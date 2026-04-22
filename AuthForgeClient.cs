@@ -71,6 +71,13 @@ namespace AuthForge
         public string ApiBaseUrl { get; }
         public Action<string, Exception?>? OnFailure { get; }
         public int RequestTimeout { get; }
+        /// <summary>
+        /// Requested session token lifetime (seconds) sent to /auth/validate.
+        /// <c>null</c> (or &lt;= 0) means "let the server pick its default" (24h today).
+        /// The server clamps to [3600, 604800]; out-of-range values are silently clamped.
+        /// Heartbeats refresh the token while preserving the requested lifetime.
+        /// </summary>
+        public int? TtlSeconds { get; }
 
         private readonly Ed25519PublicKeyParameters _verifyPublicKey;
 
@@ -82,7 +89,8 @@ namespace AuthForge
             int heartbeatInterval = 900,
             string apiBaseUrl = DefaultApiBaseUrl,
             Action<string, Exception?>? onFailure = null,
-            int requestTimeout = 15)
+            int requestTimeout = 15,
+            int? ttlSeconds = null)
         {
             if (string.IsNullOrEmpty(appId))
             {
@@ -117,6 +125,7 @@ namespace AuthForge
             ApiBaseUrl = (apiBaseUrl ?? string.Empty).TrimEnd('/');
             OnFailure = onFailure;
             RequestTimeout = requestTimeout;
+            TtlSeconds = ttlSeconds.HasValue && ttlSeconds.Value > 0 ? ttlSeconds : null;
             _httpClient = new HttpClient
             {
                 Timeout = TimeSpan.FromSeconds(RequestTimeout),
@@ -279,6 +288,10 @@ namespace AuthForge
                 ["hwid"] = _hwid,
                 ["nonce"] = GenerateNonce(),
             };
+            if (TtlSeconds.HasValue)
+            {
+                body["ttlSeconds"] = TtlSeconds.Value;
+            }
             var responseObj = PostJson("/auth/validate", body);
             var expectedNonce = body.TryGetValue("nonce", out var usedNonce) ? (usedNonce?.ToString() ?? string.Empty) : string.Empty;
             ApplySignedResponse(responseObj, expectedNonce, licenseKey, "validate");

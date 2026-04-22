@@ -26,8 +26,12 @@ jobs:
           fi
       - name: Test
         run: dotnet test AuthForge.Tests/AuthForge.Tests.csproj -c Release
+      # SDK 10+: `dotnet pack` alone on a clean tree can hit NU5026 for multi-targeted
+      # projects (pack runs before outputs exist). Build first, then pack with --no-build.
       - name: Build and pack
-        run: dotnet pack AuthForge.csproj -c Release -o dist
+        run: |
+          dotnet build AuthForge.csproj -c Release
+          dotnet pack AuthForge.csproj -c Release -o dist --no-build
       - name: Log in to NuGet via Trusted Publishing
         uses: NuGet/login@v1
         id: nuget-login

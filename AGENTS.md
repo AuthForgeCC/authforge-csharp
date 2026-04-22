@@ -9,7 +9,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 ## Installation
 
-Copy `AuthForgeClient.cs` into your project. Targets .NET 6+; uses only BCL (`System.Net.Http`, `System.Security.Cryptography`, `System.Text.Json`).
+Prefer **`dotnet add package AuthForge`** from [NuGet](https://www.nuget.org/packages/AuthForge/). Targets .NET 6+ (see the `.csproj` for package references such as `BouncyCastle.Cryptography`). You can instead copy `AuthForgeClient.cs` if you truly need a source-only integration and mirror its dependencies yourself.
 
 ## Minimal working integration
 

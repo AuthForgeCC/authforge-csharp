@@ -7,7 +7,7 @@
     <LangVersion>latest</LangVersion>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>AuthForge</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <Authors>AuthForge</Authors>
     <Description>Official AuthForge SDK for .NET — credit-based license key authentication with Ed25519-verified responses.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

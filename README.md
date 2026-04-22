@@ -4,9 +4,17 @@ Official C# SDK for [AuthForge](https://authforge.cc) — credit-based license k
 
 Dependencies: `BouncyCastle.Cryptography` for Ed25519 verification. Targets .NET 6+.
 
-## Quick Start
+## Installation
 
-Copy `AuthForgeClient.cs` into your project, then:
+The package is **`AuthForge`** on [NuGet](https://www.nuget.org/packages/AuthForge/).
+
+```bash
+dotnet add package AuthForge
+```
+
+**Alternative:** copy `AuthForgeClient.cs` into your solution if you need a source-only vendored layout (you still need the same NuGet dependencies declared in your project).
+
+## Quick Start
 
 ```csharp
 using AuthForge;

@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFrameworks>netstandard2.0;net6.0</TargetFrameworks>
     <AssemblyName>AuthForge</AssemblyName>
@@ -7,9 +7,9 @@
     <LangVersion>latest</LangVersion>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>AuthForge</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Authors>AuthForge</Authors>
-    <Description>Official AuthForge SDK for .NET — credit-based license key authentication with Ed25519-verified responses.</Description>
+    <Description>Official AuthForge SDK for .NET â€” credit-based license key authentication with Ed25519-verified responses.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://authforge.cc</PackageProjectUrl>
     <RepositoryUrl>https://github.com/AuthForgeCC/authforge-csharp</RepositoryUrl>

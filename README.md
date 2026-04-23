@@ -54,6 +54,19 @@ else
 | `onFailure` | Action\<string, Exception?\> | `null` | Callback on auth failure |
 | `requestTimeout` | int | `15` | HTTP request timeout in seconds |
 | `ttlSeconds` | int? | `null` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
+| `hwidOverride` | string? | `null` | Optional custom hardware/subject identifier. When set to a non-empty value, the SDK uses it instead of machine fingerprinting. |
+
+### Identity-based binding example (Telegram/Discord)
+
+```csharp
+var client = new AuthForgeClient(
+    appId: "YOUR_APP_ID",
+    appSecret: "YOUR_APP_SECRET",
+    publicKey: "YOUR_PUBLIC_KEY",
+    heartbeatMode: "SERVER",
+    hwidOverride: $"tg:{telegramUserId}" // or $"discord:{discordUserId}"
+);
+```
 
 ## Billing
 
@@ -67,6 +80,7 @@ Any heartbeat interval is safe economically: a desktop app running 6h/day at a 1
 | Method | Returns | Description |
 |---|---|---|
 | `Login(string licenseKey)` | `bool` | Validates key and stores signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
+| `SelfBan(...)` | `Dictionary<string, object?>` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
 | `Logout()` | `void` | Stops heartbeat and clears all session/auth state |
 | `IsAuthenticated()` | `bool` | True when an active authenticated session exists |
 | `GetSessionData()` | `Dictionary<string, object?>?` | Full decoded payload map |
@@ -84,7 +98,7 @@ Any heartbeat interval is safe economically: a desktop app running 6h/day at a 1
 If authentication fails, the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `Environment.Exit(1)` to terminate the process.** This is intentional — it prevents your app from running without a valid license.
 
 Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`
 
 Request retries are automatic inside the internal HTTP layer:
 - `rate_limited`: retry after 2s, then 5s (max 3 attempts total)
@@ -107,9 +121,33 @@ var client = new AuthForgeClient(
 );
 ```
 
+## Self-ban (tamper response)
+
+Use `SelfBan(...)` when anti-tamper checks trigger:
+
+```csharp
+// Post-session (authenticated): defaults to revoke + HWID/IP blacklist.
+client.SelfBan();
+
+// Pre-session: pass licenseKey, SDK automatically disables revokeLicense.
+client.SelfBan(licenseKey: "AF-XXXX-XXXX-XXXX");
+
+// Custom flags:
+client.SelfBan(
+    blacklistHwid: true,
+    blacklistIp: true,
+    revokeLicense: false
+);
+```
+
+`SelfBan(...)` auto-selects request mode:
+- Uses post-session mode when a session token is available (`sessionToken` argument or current SDK session).
+- Falls back to pre-session mode with `licenseKey` + nonce + app secret.
+- In pre-session mode, revoke is forced off client-side to avoid unsafe key revocations.
+
 ## How It Works
 
-1. **Login** — Collects a hardware fingerprint (MAC, CPU, disk serial), generates a random nonce, and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
+1. **Login** — Uses `hwidOverride` if provided; otherwise collects a hardware fingerprint (MAC, CPU, disk serial). It then generates a random nonce and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
 
 2. **Heartbeat** — A background thread checks in at the configured interval. In SERVER mode, it sends a fresh nonce and verifies the response. In LOCAL mode, it re-verifies the stored signature and checks expiry without network calls.
 

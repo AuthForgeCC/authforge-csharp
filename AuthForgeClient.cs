@@ -41,6 +41,7 @@ namespace AuthForge
             "replay_detected",
             "app_disabled",
             "session_expired",
+            "revoke_requires_session",
             "bad_request",
             "server_error",
             "system_error",
@@ -90,7 +91,8 @@ namespace AuthForge
             string apiBaseUrl = DefaultApiBaseUrl,
             Action<string, Exception?>? onFailure = null,
             int requestTimeout = 15,
-            int? ttlSeconds = null)
+            int? ttlSeconds = null,
+            string? hwidOverride = null)
         {
             if (string.IsNullOrEmpty(appId))
             {
@@ -144,7 +146,7 @@ namespace AuthForge
                 throw new ArgumentException("public_key must be 32 bytes (base64 Ed25519 raw key)", nameof(publicKey));
             }
             _verifyPublicKey = new Ed25519PublicKeyParameters(publicKeyBytes, 0);
-            _hwid = GetHwid();
+            _hwid = ResolveHwid(hwidOverride);
         }
 
         public bool Login(string licenseKey)
@@ -165,6 +167,75 @@ namespace AuthForge
                 Fail("login_failed", ex);
                 return false;
             }
+        }
+
+        public Dictionary<string, object?> SelfBan(
+            string? licenseKey = null,
+            string? sessionToken = null,
+            bool revokeLicense = true,
+            bool blacklistHwid = true,
+            bool blacklistIp = true)
+        {
+            string? currentSessionToken;
+            string? currentLicenseKey;
+            string hwid;
+            lock (_lock)
+            {
+                currentSessionToken = _sessionToken;
+                currentLicenseKey = _licenseKey;
+                hwid = _hwid;
+            }
+
+            var resolvedSessionToken = string.IsNullOrWhiteSpace(sessionToken)
+                ? currentSessionToken
+                : sessionToken.Trim();
+            if (!string.IsNullOrWhiteSpace(resolvedSessionToken))
+            {
+                var sessionBody = new Dictionary<string, object?>
+                {
+                    ["appId"] = AppId,
+                    ["sessionToken"] = resolvedSessionToken,
+                    ["hwid"] = hwid,
+                    ["revokeLicense"] = revokeLicense,
+                    ["blacklistHwid"] = blacklistHwid,
+                    ["blacklistIp"] = blacklistIp,
+                };
+                var responseObj = PostJson("/auth/selfban", sessionBody);
+                responseObj.TryGetValue("status", out var statusElement);
+                if (!IsSuccessStatus(statusElement))
+                {
+                    throw new ArgumentException(ExtractServerError(responseObj));
+                }
+                return ConvertToObjectMap(responseObj);
+            }
+
+            var resolvedLicenseKey = string.IsNullOrWhiteSpace(licenseKey)
+                ? currentLicenseKey
+                : licenseKey.Trim();
+            if (string.IsNullOrWhiteSpace(resolvedLicenseKey))
+            {
+                throw new ArgumentException("missing_license_key");
+            }
+
+            var preSessionBody = new Dictionary<string, object?>
+            {
+                ["appId"] = AppId,
+                ["appSecret"] = AppSecret,
+                ["licenseKey"] = resolvedLicenseKey,
+                ["hwid"] = hwid,
+                ["nonce"] = GenerateNonce(),
+                // Pre-session self-ban cannot revoke licenses.
+                ["revokeLicense"] = false,
+                ["blacklistHwid"] = blacklistHwid,
+                ["blacklistIp"] = blacklistIp,
+            };
+            var preSessionResponse = PostJson("/auth/selfban", preSessionBody);
+            preSessionResponse.TryGetValue("status", out var preSessionStatus);
+            if (!IsSuccessStatus(preSessionStatus))
+            {
+                throw new ArgumentException(ExtractServerError(preSessionResponse));
+            }
+            return ConvertToObjectMap(preSessionResponse);
         }
 
         private void StartHeartbeatOnce()
@@ -485,6 +556,12 @@ namespace AuthForge
                 hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(material));
             }
             return ToHexLower(hash);
+        }
+
+        private string ResolveHwid(string? hwidOverride)
+        {
+            var trimmed = (hwidOverride ?? string.Empty).Trim();
+            return trimmed.Length > 0 ? trimmed : GetHwid();
         }
 
         private string SafeMacAddress()

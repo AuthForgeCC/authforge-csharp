@@ -70,7 +70,7 @@ var client = new AuthForgeClient(
 
 ## Billing
 
-- **One `Login()` call = 1 credit** (one `/auth/validate` debit).
+- **One `Login()` or `ValidateLicense()` call = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats on the same session = 1 credit** (debited on every 10th successful heartbeat).
 
 Any heartbeat interval is safe economically: a desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day; a server app running 24/7 at a 1-minute interval burns ~145 credits/day. Choose your interval based on how quickly you need revocations to propagate (they always land on the **next** heartbeat).
@@ -80,6 +80,7 @@ Any heartbeat interval is safe economically: a desktop app running 6h/day at a 1
 | Method | Returns | Description |
 |---|---|---|
 | `Login(string licenseKey)` | `bool` | Validates key and stores signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
+| `ValidateLicense(string licenseKey)` | `ValidateLicenseResult` | Same `/auth/validate` + signatures as `Login`; does not update client session or start heartbeats; **never** calls `onFailure` or `Environment.Exit` |
 | `SelfBan(...)` | `Dictionary<string, object?>` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
 | `Logout()` | `void` | Stops heartbeat and clears all session/auth state |
 | `IsAuthenticated()` | `bool` | True when an active authenticated session exists |
@@ -96,6 +97,8 @@ Any heartbeat interval is safe economically: a desktop app running 6h/day at a 1
 ## Failure Handling
 
 If authentication fails, the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `Environment.Exit(1)` to terminate the process.** This is intentional — it prevents your app from running without a valid license.
+
+**`ValidateLicense()`** returns a result object instead; it does not invoke `onFailure` or exit for validate/network failures.
 
 Recognized server errors:
 `invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`

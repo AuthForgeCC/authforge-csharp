@@ -169,6 +169,64 @@ namespace AuthForge
             }
         }
 
+        /// <summary>
+        /// Performs the same <c>/auth/validate</c> request and Ed25519 verification as <see cref="Login"/>,
+        /// without updating client session state or starting the heartbeat thread.
+        /// </summary>
+        public ValidateLicenseResult ValidateLicense(string licenseKey)
+        {
+            if (string.IsNullOrEmpty(licenseKey))
+            {
+                throw new ArgumentException("license_key must be a non-empty string", nameof(licenseKey));
+            }
+
+            try
+            {
+                var body = new Dictionary<string, object?>
+                {
+                    ["appId"] = AppId,
+                    ["appSecret"] = AppSecret,
+                    ["licenseKey"] = licenseKey,
+                    ["hwid"] = _hwid,
+                    ["nonce"] = GenerateNonce(),
+                };
+                if (TtlSeconds.HasValue)
+                {
+                    body["ttlSeconds"] = TtlSeconds.Value;
+                }
+
+                var responseObj = PostJson("/auth/validate", body, skipFailureOnNetwork: true);
+                var expectedNonce = body.TryGetValue("nonce", out var usedNonce) ? (usedNonce?.ToString() ?? string.Empty) : string.Empty;
+                var parsed = ParseSignedValidateResponse(responseObj, expectedNonce);
+                var sessionData = ConvertToObjectMap(parsed.PayloadJson);
+                var appVars = parsed.PayloadJson.TryGetValue("appVariables", out var appVarsElement)
+                    ? ConvertJsonElementObject(appVarsElement)
+                    : null;
+                var licenseVars = parsed.PayloadJson.TryGetValue("licenseVariables", out var licenseVarsElement)
+                    ? ConvertJsonElementObject(licenseVarsElement)
+                    : null;
+                return new ValidateLicenseResult
+                {
+                    Valid = true,
+                    SessionToken = parsed.SessionToken,
+                    ExpiresIn = parsed.ExpiresIn,
+                    SessionData = new Dictionary<string, object?>(sessionData, StringComparer.Ordinal),
+                    AppVariables = appVars is null ? null : new Dictionary<string, object?>(appVars, StringComparer.Ordinal),
+                    LicenseVariables = licenseVars is null ? null : new Dictionary<string, object?>(licenseVars, StringComparer.Ordinal),
+                    KeyId = parsed.KeyId,
+                };
+            }
+            catch (Exception ex)
+            {
+                return new ValidateLicenseResult
+                {
+                    Valid = false,
+                    ErrorCode = ex.Message,
+                    Error = ex,
+                };
+            }
+        }
+
         public Dictionary<string, object?> SelfBan(
             string? licenseKey = null,
             string? sessionToken = null,
@@ -368,11 +426,19 @@ namespace AuthForge
             ApplySignedResponse(responseObj, expectedNonce, licenseKey, "validate");
         }
 
-        private void ApplySignedResponse(
+        private sealed class ParsedValidateSession
+        {
+            public string SessionToken { get; set; } = string.Empty;
+            public long ExpiresIn { get; set; }
+            public string RawPayloadB64 { get; set; } = string.Empty;
+            public string Signature { get; set; } = string.Empty;
+            public string? KeyId { get; set; }
+            public Dictionary<string, JsonElement> PayloadJson { get; set; } = new(StringComparer.Ordinal);
+        }
+
+        private ParsedValidateSession ParseSignedValidateResponse(
             Dictionary<string, JsonElement> responseObj,
-            string expectedNonce,
-            string? licenseKey,
-            string context)
+            string expectedNonce)
         {
             responseObj.TryGetValue("status", out var statusElement);
             if (!IsSuccessStatus(statusElement))
@@ -392,7 +458,6 @@ namespace AuthForge
                 throw new ArgumentException("nonce_mismatch");
             }
 
-            _ = context;
             VerifySignature(rawPayloadB64, signature);
 
             var sessionToken = payloadJson.TryGetValue("sessionToken", out var sessionTokenElement)
@@ -416,6 +481,26 @@ namespace AuthForge
                 throw new ArgumentException("missing_expiresIn");
             }
 
+            return new ParsedValidateSession
+            {
+                SessionToken = sessionToken,
+                ExpiresIn = expiresIn.Value,
+                RawPayloadB64 = rawPayloadB64,
+                Signature = signature,
+                KeyId = responseObj.TryGetValue("keyId", out var keyIdElement) ? keyIdElement.ToString() : null,
+                PayloadJson = payloadJson,
+            };
+        }
+
+        private void ApplySignedResponse(
+            Dictionary<string, JsonElement> responseObj,
+            string expectedNonce,
+            string? licenseKey,
+            string context)
+        {
+            var parsed = ParseSignedValidateResponse(responseObj, expectedNonce);
+            _ = context;
+
             lock (_lock)
             {
                 if (licenseKey is not null)
@@ -423,24 +508,24 @@ namespace AuthForge
                     _licenseKey = licenseKey;
                 }
 
-                _sessionToken = sessionToken;
-                _sessionExpiresIn = expiresIn.Value;
+                _sessionToken = parsed.SessionToken;
+                _sessionExpiresIn = parsed.ExpiresIn;
                 _lastNonce = expectedNonce;
-                _rawPayloadB64 = rawPayloadB64;
-                _signature = signature;
-                _keyId = responseObj.TryGetValue("keyId", out var keyIdElement) ? keyIdElement.ToString() : null;
-                _sessionData = ConvertToObjectMap(payloadJson);
-                _appVariables = payloadJson.TryGetValue("appVariables", out var appVarsElement)
+                _rawPayloadB64 = parsed.RawPayloadB64;
+                _signature = parsed.Signature;
+                _keyId = parsed.KeyId;
+                _sessionData = ConvertToObjectMap(parsed.PayloadJson);
+                _appVariables = parsed.PayloadJson.TryGetValue("appVariables", out var appVarsElement)
                     ? ConvertJsonElementObject(appVarsElement)
                     : null;
-                _licenseVariables = payloadJson.TryGetValue("licenseVariables", out var licenseVarsElement)
+                _licenseVariables = parsed.PayloadJson.TryGetValue("licenseVariables", out var licenseVarsElement)
                     ? ConvertJsonElementObject(licenseVarsElement)
                     : null;
                 _authenticated = true;
             }
         }
 
-        private Dictionary<string, JsonElement> PostJson(string path, Dictionary<string, object?> data)
+        private Dictionary<string, JsonElement> PostJson(string path, Dictionary<string, object?> data, bool skipFailureOnNetwork = false)
         {
             var url = $"{ApiBaseUrl}{path}";
             var body = new Dictionary<string, object?>(data, StringComparer.Ordinal);
@@ -498,7 +583,10 @@ namespace AuthForge
                         Thread.Sleep(TimeSpan.FromSeconds(2));
                         continue;
                     }
-                    Fail("network_error", ex);
+                    if (!skipFailureOnNetwork)
+                    {
+                        Fail("network_error", ex);
+                    }
                     throw new InvalidOperationException($"url_error: {ex.Message}", ex);
                 }
                 catch (TaskCanceledException ex)
@@ -509,7 +597,10 @@ namespace AuthForge
                         Thread.Sleep(TimeSpan.FromSeconds(2));
                         continue;
                     }
-                    Fail("network_error", ex);
+                    if (!skipFailureOnNetwork)
+                    {
+                        Fail("network_error", ex);
+                    }
                     throw new InvalidOperationException($"url_error: {ex.Message}", ex);
                 }
             }
@@ -803,8 +894,18 @@ namespace AuthForge
             }
         }
 
+        /// <summary>
+        /// Integration test hook: when set, returned by <see cref="GenerateNonce"/> (same assembly only).
+        /// </summary>
+        internal static string? TestNonceOverride { get; set; }
+
         private static string GenerateNonce()
         {
+            if (!string.IsNullOrEmpty(TestNonceOverride))
+            {
+                return TestNonceOverride!;
+            }
+
             var bytes = new byte[16];
             using (var random = RandomNumberGenerator.Create())
             {
@@ -984,5 +1085,18 @@ namespace AuthForge
             }
             return result;
         }
+    }
+
+    public sealed class ValidateLicenseResult
+    {
+        public bool Valid { get; set; }
+        public string? ErrorCode { get; set; }
+        public Exception? Error { get; set; }
+        public string? SessionToken { get; set; }
+        public long? ExpiresIn { get; set; }
+        public Dictionary<string, object?>? SessionData { get; set; }
+        public Dictionary<string, object?>? AppVariables { get; set; }
+        public Dictionary<string, object?>? LicenseVariables { get; set; }
+        public string? KeyId { get; set; }
     }
 }

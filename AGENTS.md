@@ -57,7 +57,7 @@ client.Logout();
 | `heartbeatMode` | `string` | yes | — | `"SERVER"` or `"LOCAL"` (case-insensitive) |
 | `heartbeatInterval` | `int` | no | `900` | Seconds between heartbeats (any value ≥ 1 is supported; revocations apply on the next heartbeat) |
 | `apiBaseUrl` | `string` | no | `https://auth.authforge.cc` | API base URL |
-| `onFailure` | `Action<string, Exception?>?` | no | `null` | Called on failure; if null, `Environment.Exit(1)` |
+| `onFailure` | `Action<string, Exception?>?` | no | `null` | Called on login/heartbeat failure; if null, `Environment.Exit(1)` (not used by `ValidateLicense`) |
 | `requestTimeout` | `int` | no | `15` | HTTP timeout (seconds) |
 | `ttlSeconds` | `int?` | no | `null` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
 | `hwidOverride` | `string?` | no | `null` | Optional custom HWID/subject string. When set to a non-empty value (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
@@ -66,7 +66,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 
 ## Billing model
 
-- `Login()` calls `/auth/validate` and costs **1 credit**.
+- Each `Login()` or `ValidateLicense()` calls `/auth/validate` and costs **1 credit**.
 - Heartbeats cost **1 credit per 10 successful calls** (billed on every 10th heartbeat).
 - Heartbeat frequency is your choice: any interval ≥ 1 second is fine, because the cost is tied to how many heartbeats you send, not how often.
 - Revocations take effect on the **next** heartbeat regardless of interval.
@@ -76,6 +76,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `Login(string licenseKey)` | `bool` | Validates license, verifies signatures, starts heartbeat thread |
+| `ValidateLicense(string licenseKey)` | `ValidateLicenseResult` | Same validate + signatures as `Login`; no session persistence or heartbeat; **never** calls `onFailure` or `Environment.Exit` |
 | `Logout()` | `void` | Stops heartbeat and clears session state |
 | `IsAuthenticated()` | `bool` | Whether a session exists |
 | `GetSessionData()` | `Dictionary<string, object?>?` | Decoded payload map |

@@ -167,6 +167,38 @@ public class ClientTests
         }
     }
 
+    // Valid Ed25519 public key (random) used purely as a "previous" entry in
+    // the trust list, to exercise rotation handling without relying on the
+    // wire-test signature.
+    private const string DecoyPublicKey = "fKvaqROXtVWLV4h/AExsQetlJc811klm9ikLkt3fVbU=";
+
+    [Fact]
+    public void Constructor_AcceptsRotationSet_ViaIEnumerable()
+    {
+        var client = new AuthForgeClient(
+            "app",
+            "secret",
+            new[] { DecoyPublicKey, TestPublicKey },
+            "LOCAL",
+            heartbeatInterval: 3600,
+            apiBaseUrl: "http://127.0.0.1");
+        Assert.Equal(2, client.PublicKeys.Count);
+        Assert.Equal(DecoyPublicKey, client.PublicKey);
+    }
+
+    [Fact]
+    public void Constructor_AcceptsRotationSet_ViaCommaSeparatedString()
+    {
+        var client = new AuthForgeClient(
+            "app",
+            "secret",
+            DecoyPublicKey + "," + TestPublicKey,
+            "LOCAL",
+            heartbeatInterval: 3600,
+            apiBaseUrl: "http://127.0.0.1");
+        Assert.Equal(2, client.PublicKeys.Count);
+    }
+
     private static int GetFreeTcpPort()
     {
         var l = new TcpListener(IPAddress.Loopback, 0);

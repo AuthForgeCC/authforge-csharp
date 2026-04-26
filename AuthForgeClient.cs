@@ -67,6 +67,12 @@ namespace AuthForge
         public string AppId { get; }
         public string AppSecret { get; }
         public string PublicKey { get; }
+        /// <summary>
+        /// Full trust list of Ed25519 public keys. Always contains at least
+        /// one entry; the first is the primary (current) key, additional
+        /// entries are previous keys still trusted during a rotation window.
+        /// </summary>
+        public IReadOnlyList<string> PublicKeys { get; }
         public string HeartbeatMode { get; }
         public int HeartbeatInterval { get; }
         public string ApiBaseUrl { get; }
@@ -80,12 +86,46 @@ namespace AuthForge
         /// </summary>
         public int? TtlSeconds { get; }
 
-        private readonly Ed25519PublicKeyParameters _verifyPublicKey;
+        private readonly IReadOnlyList<Ed25519PublicKeyParameters> _verifyPublicKeys;
 
+        /// <summary>
+        /// Single-key constructor for backward compatibility. Forwards to the
+        /// rotation-aware overload with a single-entry trust list.
+        /// </summary>
         public AuthForgeClient(
             string appId,
             string appSecret,
             string publicKey,
+            string heartbeatMode,
+            int heartbeatInterval = 900,
+            string apiBaseUrl = DefaultApiBaseUrl,
+            Action<string, Exception?>? onFailure = null,
+            int requestTimeout = 15,
+            int? ttlSeconds = null,
+            string? hwidOverride = null)
+            : this(
+                appId,
+                appSecret,
+                NormalizePublicKeys(publicKey),
+                heartbeatMode,
+                heartbeatInterval,
+                apiBaseUrl,
+                onFailure,
+                requestTimeout,
+                ttlSeconds,
+                hwidOverride)
+        {
+        }
+
+        /// <summary>
+        /// Rotation-aware constructor. Pass the current public key first,
+        /// followed by any previous keys you want to remain trusted during a
+        /// cutover. Verification accepts a signature that matches *any* key.
+        /// </summary>
+        public AuthForgeClient(
+            string appId,
+            string appSecret,
+            IEnumerable<string> publicKeys,
             string heartbeatMode,
             int heartbeatInterval = 900,
             string apiBaseUrl = DefaultApiBaseUrl,
@@ -103,9 +143,16 @@ namespace AuthForge
             {
                 throw new ArgumentException("app_secret must be a non-empty string", nameof(appSecret));
             }
-            if (string.IsNullOrEmpty(publicKey))
+            var keyList = (publicKeys ?? Array.Empty<string>())
+                .Where(k => !string.IsNullOrWhiteSpace(k))
+                .Select(k => k.Trim())
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (keyList.Count == 0)
             {
-                throw new ArgumentException("public_key must be a non-empty string", nameof(publicKey));
+                throw new ArgumentException(
+                    "publicKeys must contain at least one non-empty base64 string",
+                    nameof(publicKeys));
             }
 
             var mode = (heartbeatMode ?? string.Empty).ToUpperInvariant();
@@ -121,7 +168,8 @@ namespace AuthForge
 
             AppId = appId;
             AppSecret = appSecret;
-            PublicKey = publicKey;
+            PublicKeys = keyList;
+            PublicKey = keyList[0];
             HeartbeatMode = mode;
             HeartbeatInterval = heartbeatInterval;
             ApiBaseUrl = (apiBaseUrl ?? string.Empty).TrimEnd('/');
@@ -132,21 +180,44 @@ namespace AuthForge
             {
                 Timeout = TimeSpan.FromSeconds(RequestTimeout),
             };
-            byte[] publicKeyBytes;
-            try
+            var verifyKeys = new List<Ed25519PublicKeyParameters>(keyList.Count);
+            foreach (var key in keyList)
             {
-                publicKeyBytes = Convert.FromBase64String(publicKey);
+                byte[] publicKeyBytes;
+                try
+                {
+                    publicKeyBytes = Convert.FromBase64String(key);
+                }
+                catch (FormatException ex)
+                {
+                    throw new ArgumentException("public_key must be valid base64", nameof(publicKeys), ex);
+                }
+                if (publicKeyBytes.Length != 32)
+                {
+                    throw new ArgumentException(
+                        "public_key must be 32 bytes (base64 Ed25519 raw key)",
+                        nameof(publicKeys));
+                }
+                verifyKeys.Add(new Ed25519PublicKeyParameters(publicKeyBytes, 0));
             }
-            catch (FormatException ex)
-            {
-                throw new ArgumentException("public_key must be valid base64", nameof(publicKey), ex);
-            }
-            if (publicKeyBytes.Length != 32)
-            {
-                throw new ArgumentException("public_key must be 32 bytes (base64 Ed25519 raw key)", nameof(publicKey));
-            }
-            _verifyPublicKey = new Ed25519PublicKeyParameters(publicKeyBytes, 0);
+            _verifyPublicKeys = verifyKeys;
             _hwid = ResolveHwid(hwidOverride);
+        }
+
+        /// <summary>
+        /// Splits the historical single-string <c>publicKey</c> argument into
+        /// the canonical list form. A comma separator is honoured so callers
+        /// can plumb a trust list through environment variables.
+        /// </summary>
+        private static IEnumerable<string> NormalizePublicKeys(string publicKey)
+        {
+            if (string.IsNullOrWhiteSpace(publicKey))
+            {
+                return Array.Empty<string>();
+            }
+            return publicKey.Contains(',')
+                ? publicKey.Split(',')
+                : new[] { publicKey };
         }
 
         public bool Login(string licenseKey)
@@ -884,14 +955,21 @@ namespace AuthForge
                 throw new ArgumentException("invalid_signature", ex);
             }
 
-            var verifier = new Ed25519Signer();
-            verifier.Init(forSigning: false, _verifyPublicKey);
+            // Walk the trust list and accept on first match. Allows callers
+            // to keep verifying during a server-side key rotation by pinning
+            // both the previous and the current key.
             var payloadBytes = Encoding.UTF8.GetBytes(rawPayloadB64);
-            verifier.BlockUpdate(payloadBytes, 0, payloadBytes.Length);
-            if (!verifier.VerifySignature(signatureBytes))
+            foreach (var key in _verifyPublicKeys)
             {
-                throw new ArgumentException("signature_mismatch");
+                var verifier = new Ed25519Signer();
+                verifier.Init(forSigning: false, key);
+                verifier.BlockUpdate(payloadBytes, 0, payloadBytes.Length);
+                if (verifier.VerifySignature(signatureBytes))
+                {
+                    return;
+                }
             }
+            throw new ArgumentException("signature_mismatch");
         }
 
         /// <summary>

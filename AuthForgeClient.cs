@@ -285,6 +285,12 @@ namespace AuthForge
                     AppVariables = appVars is null ? null : new Dictionary<string, object?>(appVars, StringComparer.Ordinal),
                     LicenseVariables = licenseVars is null ? null : new Dictionary<string, object?>(licenseVars, StringComparer.Ordinal),
                     KeyId = parsed.KeyId,
+                    SessionExpiresAt = parsed.SessionExpiresAt,
+                    LicenseExpirationPresent = parsed.LicenseExpirationPresent,
+                    LicenseExpiresAt = parsed.LicenseExpiresAt,
+                    MaxHwidSlots = parsed.MaxHwidSlots,
+                    HwidCount = parsed.HwidCount,
+                    LicenseLabel = parsed.LicenseLabel,
                 };
             }
             catch (Exception ex)
@@ -504,6 +510,12 @@ namespace AuthForge
             public string RawPayloadB64 { get; set; } = string.Empty;
             public string Signature { get; set; } = string.Empty;
             public string? KeyId { get; set; }
+            public string? SessionExpiresAt { get; set; }
+            public bool LicenseExpirationPresent { get; set; }
+            public string? LicenseExpiresAt { get; set; }
+            public int? MaxHwidSlots { get; set; }
+            public int? HwidCount { get; set; }
+            public string? LicenseLabel { get; set; }
             public Dictionary<string, JsonElement> PayloadJson { get; set; } = new(StringComparer.Ordinal);
         }
 
@@ -552,6 +564,37 @@ namespace AuthForge
                 throw new ArgumentException("missing_expiresIn");
             }
 
+            string? sessionExpiresAt = null;
+            if (payloadJson.TryGetValue("sessionExpiresAt", out var sea) && sea.ValueKind == JsonValueKind.String)
+            {
+                sessionExpiresAt = sea.GetString();
+            }
+
+            var licenseExpirationPresent = payloadJson.TryGetValue("licenseExpiresAt", out var lee);
+            string? licenseExpiresAt = null;
+            if (licenseExpirationPresent)
+            {
+                licenseExpiresAt = lee.ValueKind == JsonValueKind.Null ? null : lee.GetString();
+            }
+
+            int? maxHwidSlots = null;
+            if (payloadJson.TryGetValue("maxHwidSlots", out var mh) && mh.ValueKind != JsonValueKind.Null)
+            {
+                maxHwidSlots = ConvertToInt32Nullable(mh);
+            }
+
+            int? hwidCount = null;
+            if (payloadJson.TryGetValue("hwidCount", out var hc) && hc.ValueKind != JsonValueKind.Null)
+            {
+                hwidCount = ConvertToInt32Nullable(hc);
+            }
+
+            string? licenseLabel = null;
+            if (payloadJson.TryGetValue("licenseLabel", out var ll) && ll.ValueKind == JsonValueKind.String)
+            {
+                licenseLabel = ll.GetString();
+            }
+
             return new ParsedValidateSession
             {
                 SessionToken = sessionToken,
@@ -559,6 +602,12 @@ namespace AuthForge
                 RawPayloadB64 = rawPayloadB64,
                 Signature = signature,
                 KeyId = responseObj.TryGetValue("keyId", out var keyIdElement) ? keyIdElement.ToString() : null,
+                SessionExpiresAt = sessionExpiresAt,
+                LicenseExpirationPresent = licenseExpirationPresent,
+                LicenseExpiresAt = licenseExpiresAt,
+                MaxHwidSlots = maxHwidSlots,
+                HwidCount = hwidCount,
+                LicenseLabel = licenseLabel,
                 PayloadJson = payloadJson,
             };
         }
@@ -1118,6 +1167,31 @@ namespace AuthForge
             }
         }
 
+        private static int? ConvertToInt32Nullable(JsonElement element)
+        {
+            try
+            {
+                var v = ConvertToInt64(element);
+                if (v > int.MaxValue || v < int.MinValue)
+                {
+                    return null;
+                }
+                return (int)v;
+            }
+            catch (ArgumentException)
+            {
+                return null;
+            }
+            catch (OverflowException)
+            {
+                return null;
+            }
+            catch (FormatException)
+            {
+                return null;
+            }
+        }
+
         private static long ConvertToInt64(JsonElement element)
         {
             if (element.ValueKind == JsonValueKind.Number && element.TryGetInt64(out var int64Value))
@@ -1176,5 +1250,15 @@ namespace AuthForge
         public Dictionary<string, object?>? AppVariables { get; set; }
         public Dictionary<string, object?>? LicenseVariables { get; set; }
         public string? KeyId { get; set; }
+        /// <summary>ISO 8601 session expiry when the server includes <c>sessionExpiresAt</c>.</summary>
+        public string? SessionExpiresAt { get; set; }
+        /// <summary>True when the signed payload included <c>licenseExpiresAt</c> (lifetime keys use JSON null).</summary>
+        public bool LicenseExpirationPresent { get; set; }
+        /// <summary>License expiry when <see cref="LicenseExpirationPresent"/>; null for lifetime keys.</summary>
+        public string? LicenseExpiresAt { get; set; }
+        public int? MaxHwidSlots { get; set; }
+        public int? HwidCount { get; set; }
+        /// <summary>Optional dashboard label from the signed payload.</summary>
+        public string? LicenseLabel { get; set; }
     }
 }

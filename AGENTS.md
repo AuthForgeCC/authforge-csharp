@@ -55,7 +55,7 @@ client.Logout();
 | `appId` | `string` | yes | — | Application ID |
 | `appSecret` | `string` | yes | — | Application secret |
 | `heartbeatMode` | `string` | yes | — | `"SERVER"` or `"LOCAL"` (case-insensitive) |
-| `heartbeatInterval` | `int` | no | `900` | Seconds between heartbeats (any value ≥ 1 is supported; revocations apply on the next heartbeat) |
+| `heartbeatInterval` | `int` | no | `900` | Seconds between heartbeats (minimum `10`; revocations apply on the next heartbeat) |
 | `apiBaseUrl` | `string` | no | `https://auth.authforge.cc` | API base URL |
 | `onFailure` | `Action<string, Exception?>?` | no | `null` | Called on login/heartbeat failure; if null, `Environment.Exit(1)` (not used by `ValidateLicense`) |
 | `requestTimeout` | `int` | no | `15` | HTTP timeout (seconds) |
@@ -68,7 +68,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 
 - Each `Login()` or `ValidateLicense()` calls `/auth/validate` and costs **1 credit**.
 - Heartbeats cost **1 credit per 10 successful calls** (billed on every 10th heartbeat).
-- Heartbeat frequency is your choice: any interval ≥ 1 second is fine, because the cost is tied to how many heartbeats you send, not how often.
+- Keep heartbeat interval at or above 10 seconds. `/auth/heartbeat` is limited to 6 requests/minute per license key; cost still scales with how many heartbeats you send.
 - Revocations take effect on the **next** heartbeat regardless of interval.
 
 ## Methods
@@ -88,7 +88,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, blocked, rate_limited, replay_detected, session_expired, app_disabled, bad_request
 
 Notes:
-- `rate_limited` and `replay_detected` are only returned from `/auth/validate`. Heartbeats are not IP rate-limited and do not enforce nonce replay.
+- `replay_detected` is validate-only. `rate_limited` can be returned by `/auth/validate` and `/auth/heartbeat` (heartbeat is license-limited at 6/min and has no app-layer IP limit).
 
 ## Common patterns
 

@@ -43,6 +43,7 @@ namespace AuthForge
             "session_expired",
             "revoke_requires_session",
             "bad_request",
+            "malformed_request",
             "server_error",
             "system_error",
         };
@@ -161,9 +162,9 @@ namespace AuthForge
                 throw new ArgumentException("heartbeat_mode must be LOCAL or SERVER", nameof(heartbeatMode));
             }
 
-            if (heartbeatInterval <= 0)
+            if (heartbeatInterval < 10)
             {
-                throw new ArgumentException("heartbeat_interval must be > 0", nameof(heartbeatInterval));
+                throw new ArgumentException("heartbeat_interval must be >= 10", nameof(heartbeatInterval));
             }
 
             AppId = appId;

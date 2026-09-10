@@ -20,13 +20,33 @@ public class ClientTests
             "test-app",
             "test-secret",
             TestPublicKey,
-            "LOCAL",
             heartbeatInterval: 3600,
             apiBaseUrl: "http://127.0.0.1");
 
         Assert.False(client.IsAuthenticated());
     }
 
+    [Fact]
+    public void Constructor_Default_HasOnlineHeartbeatFalse()
+    {
+        var client = new AuthForgeClient("a", "b", TestPublicKey, apiBaseUrl: "http://127.0.0.1");
+        Assert.False(client.OnlineHeartbeat);
+    }
+
+    [Fact]
+    public void Constructor_OnlineHeartbeatTrue_IsAccepted()
+    {
+        var client = new AuthForgeClient(
+            "a",
+            "b",
+            TestPublicKey,
+            onlineHeartbeat: true,
+            heartbeatInterval: 3600,
+            apiBaseUrl: "http://127.0.0.1");
+        Assert.True(client.OnlineHeartbeat);
+    }
+
+#pragma warning disable CS0618 // Intentional coverage of the legacy heartbeatMode overloads.
     [Theory]
     [InlineData("OFF")]
     [InlineData("")]
@@ -37,6 +57,23 @@ public class ClientTests
             new AuthForgeClient("a", "b", TestPublicKey, mode, 900, apiBaseUrl: "http://127.0.0.1"));
         Assert.Equal("heartbeatMode", ex.ParamName);
     }
+
+    [Fact]
+    public void Constructor_LegacyServerMode_MapsToOnlineHeartbeatTrue()
+    {
+        var client = new AuthForgeClient("a", "b", TestPublicKey, "SERVER", apiBaseUrl: "http://127.0.0.1");
+        Assert.True(client.OnlineHeartbeat);
+        Assert.Equal("SERVER", client.HeartbeatMode);
+    }
+
+    [Fact]
+    public void Constructor_LegacyLocalMode_MapsToOnlineHeartbeatFalse()
+    {
+        var client = new AuthForgeClient("a", "b", TestPublicKey, "LOCAL", apiBaseUrl: "http://127.0.0.1");
+        Assert.False(client.OnlineHeartbeat);
+        Assert.Equal("LOCAL", client.HeartbeatMode);
+    }
+#pragma warning restore CS0618
 
     [Fact]
     public void GenerateNonce_ProducesUniqueValues()
@@ -104,7 +141,6 @@ public class ClientTests
                 "app-id",
                 "app-secret",
                 publicKey,
-                "LOCAL",
                 heartbeatInterval: 3600,
                 apiBaseUrl: prefix.TrimEnd('/'));
             var result = client.ValidateLicense("license-key");
@@ -152,7 +188,6 @@ public class ClientTests
                 "app-id",
                 "app-secret",
                 TestPublicKey,
-                "LOCAL",
                 heartbeatInterval: 3600,
                 apiBaseUrl: prefix.TrimEnd('/'));
             var result = client.ValidateLicense("bad");
@@ -179,7 +214,6 @@ public class ClientTests
             "app",
             "secret",
             new[] { DecoyPublicKey, TestPublicKey },
-            "LOCAL",
             heartbeatInterval: 3600,
             apiBaseUrl: "http://127.0.0.1");
         Assert.Equal(2, client.PublicKeys.Count);
@@ -193,7 +227,6 @@ public class ClientTests
             "app",
             "secret",
             DecoyPublicKey + "," + TestPublicKey,
-            "LOCAL",
             heartbeatInterval: 3600,
             apiBaseUrl: "http://127.0.0.1");
         Assert.Equal(2, client.PublicKeys.Count);

@@ -19,8 +19,7 @@ public class CryptoTests
         Assert.Throws<ArgumentException>(() => new AuthForgeClient(
             appId: "test-app-id",
             appSecret: "test-app-secret",
-            publicKey: "not_base64",
-            heartbeatMode: "LOCAL"));
+            publicKey: "not_base64"));
     }
 
     [Theory]
@@ -32,7 +31,6 @@ public class CryptoTests
             appId: "test-app-id",
             appSecret: "test-app-secret",
             publicKey: vectors.PublicKey,
-            heartbeatMode: "LOCAL",
             apiBaseUrl: "http://127.0.0.1");
 
         var result = Record.Exception(() => InvokeVerifySignature(client, payload, signature));

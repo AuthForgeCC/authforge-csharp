@@ -74,25 +74,77 @@ namespace AuthForge
         /// entries are previous keys still trusted during a rotation window.
         /// </summary>
         public IReadOnlyList<string> PublicKeys { get; }
-        public string HeartbeatMode { get; }
+        /// <summary>
+        /// When <c>true</c>, the SDK performs online check-ins: it calls
+        /// <c>/auth/heartbeat</c> every <see cref="HeartbeatInterval"/> seconds
+        /// for fast revocation and concurrent-use detection. When <c>false</c>
+        /// (the default), the app runs through the grace period: it keeps
+        /// re-verifying the signed session locally and fails once the session
+        /// TTL expires, with no network traffic after activation.
+        /// </summary>
+        public bool OnlineHeartbeat { get; }
+        /// <summary>
+        /// Legacy mode string derived from <see cref="OnlineHeartbeat"/>:
+        /// "SERVER" when online check-ins are enabled, otherwise "LOCAL".
+        /// </summary>
+        [Obsolete("HeartbeatMode is deprecated: use OnlineHeartbeat instead. \"SERVER\" corresponds to OnlineHeartbeat == true and \"LOCAL\" to the default (false).")]
+        public string HeartbeatMode => OnlineHeartbeat ? "SERVER" : "LOCAL";
         public int HeartbeatInterval { get; }
         public string ApiBaseUrl { get; }
         public Action<string, Exception?>? OnFailure { get; }
         public int RequestTimeout { get; }
         /// <summary>
-        /// Requested session token lifetime (seconds) sent to /auth/validate.
-        /// <c>null</c> (or &lt;= 0) means "let the server pick its default" (24h today).
-        /// The server clamps to [3600, 604800]; out-of-range values are silently clamped.
-        /// Heartbeats refresh the token while preserving the requested lifetime.
+        /// Requested grace period duration (seconds), sent to /auth/validate as
+        /// the session token lifetime. The grace period is how long the app
+        /// keeps running on the signed session without contacting AuthForge.
+        /// <c>null</c> (or &lt;= 0) means "let the server pick its default"
+        /// (24h today). The server clamps to [3600, 604800] (1h to 7d);
+        /// out-of-range values are silently clamped. Online check-ins refresh
+        /// the token while preserving the requested lifetime.
         /// </summary>
         public int? TtlSeconds { get; }
 
         private readonly IReadOnlyList<Ed25519PublicKeyParameters> _verifyPublicKeys;
 
         /// <summary>
-        /// Single-key constructor for backward compatibility. Forwards to the
-        /// rotation-aware overload with a single-entry trust list.
+        /// Single-key constructor. Forwards to the rotation-aware overload
+        /// with a single-entry trust list. Activates online via
+        /// <c>/auth/validate</c>; by default the app then runs through the
+        /// grace period (the session TTL) without contacting AuthForge. Set
+        /// <paramref name="onlineHeartbeat"/> to <c>true</c> to enable online
+        /// check-ins via <c>/auth/heartbeat</c>.
         /// </summary>
+        public AuthForgeClient(
+            string appId,
+            string appSecret,
+            string publicKey,
+            bool onlineHeartbeat = false,
+            int heartbeatInterval = 900,
+            string apiBaseUrl = DefaultApiBaseUrl,
+            Action<string, Exception?>? onFailure = null,
+            int requestTimeout = 15,
+            int? ttlSeconds = null,
+            string? hwidOverride = null)
+            : this(
+                appId,
+                appSecret,
+                NormalizePublicKeys(publicKey),
+                onlineHeartbeat,
+                heartbeatInterval,
+                apiBaseUrl,
+                onFailure,
+                requestTimeout,
+                ttlSeconds,
+                hwidOverride)
+        {
+        }
+
+        /// <summary>
+        /// Legacy single-key constructor kept for source compatibility.
+        /// Validates <paramref name="heartbeatMode"/> ("LOCAL" or "SERVER")
+        /// and delegates to the <c>bool onlineHeartbeat</c> overload.
+        /// </summary>
+        [Obsolete("heartbeatMode is deprecated: LOCAL maps to the default grace period behavior (just remove the argument) and SERVER maps to onlineHeartbeat: true.")]
         public AuthForgeClient(
             string appId,
             string appSecret,
@@ -107,8 +159,8 @@ namespace AuthForge
             : this(
                 appId,
                 appSecret,
-                NormalizePublicKeys(publicKey),
-                heartbeatMode,
+                publicKey,
+                ParseHeartbeatMode(heartbeatMode),
                 heartbeatInterval,
                 apiBaseUrl,
                 onFailure,
@@ -119,15 +171,64 @@ namespace AuthForge
         }
 
         /// <summary>
-        /// Rotation-aware constructor. Pass the current public key first,
-        /// followed by any previous keys you want to remain trusted during a
-        /// cutover. Verification accepts a signature that matches *any* key.
+        /// Legacy rotation-aware constructor kept for source compatibility.
+        /// Validates <paramref name="heartbeatMode"/> ("LOCAL" or "SERVER")
+        /// and delegates to the <c>bool onlineHeartbeat</c> overload.
         /// </summary>
+        [Obsolete("heartbeatMode is deprecated: LOCAL maps to the default grace period behavior (just remove the argument) and SERVER maps to onlineHeartbeat: true.")]
         public AuthForgeClient(
             string appId,
             string appSecret,
             IEnumerable<string> publicKeys,
             string heartbeatMode,
+            int heartbeatInterval = 900,
+            string apiBaseUrl = DefaultApiBaseUrl,
+            Action<string, Exception?>? onFailure = null,
+            int requestTimeout = 15,
+            int? ttlSeconds = null,
+            string? hwidOverride = null)
+            : this(
+                appId,
+                appSecret,
+                publicKeys,
+                ParseHeartbeatMode(heartbeatMode),
+                heartbeatInterval,
+                apiBaseUrl,
+                onFailure,
+                requestTimeout,
+                ttlSeconds,
+                hwidOverride)
+        {
+        }
+
+        /// <summary>
+        /// Maps the legacy heartbeat mode string onto the onlineHeartbeat
+        /// flag, preserving the historical validation error.
+        /// </summary>
+        private static bool ParseHeartbeatMode(string heartbeatMode)
+        {
+            var mode = (heartbeatMode ?? string.Empty).ToUpperInvariant();
+            if (mode != "LOCAL" && mode != "SERVER")
+            {
+                throw new ArgumentException("heartbeat_mode must be LOCAL or SERVER", nameof(heartbeatMode));
+            }
+            return mode == "SERVER";
+        }
+
+        /// <summary>
+        /// Primary rotation-aware constructor. Pass the current public key
+        /// first, followed by any previous keys you want to remain trusted
+        /// during a cutover. Verification accepts a signature that matches
+        /// *any* key. Activates online via <c>/auth/validate</c>; by default
+        /// the app then runs through the grace period (the session TTL)
+        /// without contacting AuthForge. Set <paramref name="onlineHeartbeat"/>
+        /// to <c>true</c> to enable online check-ins via <c>/auth/heartbeat</c>.
+        /// </summary>
+        public AuthForgeClient(
+            string appId,
+            string appSecret,
+            IEnumerable<string> publicKeys,
+            bool onlineHeartbeat = false,
             int heartbeatInterval = 900,
             string apiBaseUrl = DefaultApiBaseUrl,
             Action<string, Exception?>? onFailure = null,
@@ -156,12 +257,6 @@ namespace AuthForge
                     nameof(publicKeys));
             }
 
-            var mode = (heartbeatMode ?? string.Empty).ToUpperInvariant();
-            if (mode != "LOCAL" && mode != "SERVER")
-            {
-                throw new ArgumentException("heartbeat_mode must be LOCAL or SERVER", nameof(heartbeatMode));
-            }
-
             if (heartbeatInterval < 10)
             {
                 throw new ArgumentException("heartbeat_interval must be >= 10", nameof(heartbeatInterval));
@@ -171,7 +266,7 @@ namespace AuthForge
             AppSecret = appSecret;
             PublicKeys = keyList;
             PublicKey = keyList[0];
-            HeartbeatMode = mode;
+            OnlineHeartbeat = onlineHeartbeat;
             HeartbeatInterval = heartbeatInterval;
             ApiBaseUrl = (apiBaseUrl ?? string.Empty).TrimEnd('/');
             OnFailure = onFailure;
@@ -408,13 +503,13 @@ namespace AuthForge
                 }
                 try
                 {
-                    if (HeartbeatMode == "SERVER")
+                    if (OnlineHeartbeat)
                     {
                         ServerHeartbeat();
                     }
                     else
                     {
-                        LocalHeartbeat();
+                        GracePeriodCheck();
                     }
                 }
                 catch (Exception ex)
@@ -452,7 +547,12 @@ namespace AuthForge
             ApplySignedResponse(responseObj, expectedNonce, null, "heartbeat");
         }
 
-        private void LocalHeartbeat()
+        /// <summary>
+        /// Grace period check: without any network traffic, re-verifies the
+        /// signed session captured at activation and fails once the session
+        /// TTL (the grace period) has expired.
+        /// </summary>
+        private void GracePeriodCheck()
         {
             string? rawPayloadB64;
             string? signature;

@@ -21,9 +21,11 @@
 
   <ItemGroup>
     <Compile Include="..\AuthForgeClient.cs" Link="AuthForgeClient.cs" />
+    <Compile Include="..\AuthForgeClient.Offline.cs" Link="AuthForgeClient.Offline.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <None Include="..\test_vectors.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\offline_license_vectors.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

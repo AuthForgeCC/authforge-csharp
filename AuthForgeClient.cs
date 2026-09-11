@@ -17,7 +17,18 @@ using Org.BouncyCastle.Crypto.Signers;
 
 namespace AuthForge
 {
-    public sealed class AuthForgeClient
+    /// <summary>
+    /// Kind of session the client currently holds: an online server session
+    /// (from <see cref="AuthForgeClient.Login"/>) or an offline license file
+    /// (from <see cref="AuthForgeClient.LoginFromFile"/>).
+    /// </summary>
+    public enum SessionKind
+    {
+        Online,
+        Offline,
+    }
+
+    public sealed partial class AuthForgeClient
     {
         private const string DefaultApiBaseUrl = "https://auth.authforge.cc";
         private static readonly JsonSerializerOptions CompactJsonOptions = new JsonSerializerOptions
@@ -63,6 +74,8 @@ namespace AuthForge
         private Dictionary<string, object?>? _appVariables;
         private Dictionary<string, object?>? _licenseVariables;
         private bool _authenticated;
+        private SessionKind? _sessionKind;
+        private OfflineLicense? _offlineLicense;
         private readonly string _hwid;
 
         public string AppId { get; }
@@ -410,11 +423,22 @@ namespace AuthForge
             string? currentSessionToken;
             string? currentLicenseKey;
             string hwid;
+            SessionKind? currentKind;
             lock (_lock)
             {
                 currentSessionToken = _sessionToken;
                 currentLicenseKey = _licenseKey;
                 hwid = _hwid;
+                currentKind = _sessionKind;
+            }
+
+            // An offline session has no server session to revoke and no
+            // license key the server should hear about: fail locally, no HTTP.
+            if (currentKind == SessionKind.Offline
+                && string.IsNullOrWhiteSpace(sessionToken)
+                && string.IsNullOrWhiteSpace(licenseKey))
+            {
+                throw new ArgumentException("offline_session");
             }
 
             var resolvedSessionToken = string.IsNullOrWhiteSpace(sessionToken)
@@ -473,7 +497,7 @@ namespace AuthForge
         {
             lock (_lock)
             {
-                if (_heartbeatStarted)
+                if (_heartbeatStarted || _sessionKind == SessionKind.Offline)
                 {
                     return;
                 }
@@ -743,6 +767,7 @@ namespace AuthForge
                     ? ConvertJsonElementObject(licenseVarsElement)
                     : null;
                 _authenticated = true;
+                _sessionKind = SessionKind.Online;
             }
         }
 
@@ -856,7 +881,7 @@ namespace AuthForge
             }
         }
 
-        private string GetHwid()
+        private string ComputeHwid()
         {
             var mac = SafeMacAddress();
             var cpu = SafeCpuInfo();
@@ -873,7 +898,7 @@ namespace AuthForge
         private string ResolveHwid(string? hwidOverride)
         {
             var trimmed = (hwidOverride ?? string.Empty).Trim();
-            return trimmed.Length > 0 ? trimmed : GetHwid();
+            return trimmed.Length > 0 ? trimmed : ComputeHwid();
         }
 
         private string SafeMacAddress()
@@ -1233,6 +1258,8 @@ namespace AuthForge
                 _appVariables = null;
                 _licenseVariables = null;
                 _authenticated = false;
+                _sessionKind = null;
+                _offlineLicense = null;
             }
         }
 
@@ -1240,7 +1267,30 @@ namespace AuthForge
         {
             lock (_lock)
             {
-                return _authenticated && !string.IsNullOrEmpty(_sessionToken);
+                switch (_sessionKind)
+                {
+                    case SessionKind.Online:
+                        return _authenticated && !string.IsNullOrEmpty(_sessionToken);
+                    case SessionKind.Offline:
+                        return _authenticated && _offlineLicense != null;
+                    case null:
+                        return false;
+                    default:
+                        throw new InvalidOperationException($"unhandled session kind: {_sessionKind}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// <see cref="SessionKind.Online"/> after <see cref="Login"/>,
+        /// <see cref="SessionKind.Offline"/> after <see cref="LoginFromFile"/>,
+        /// <c>null</c> when logged out.
+        /// </summary>
+        public SessionKind? GetSessionKind()
+        {
+            lock (_lock)
+            {
+                return _sessionKind;
             }
         }
 

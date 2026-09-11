@@ -7,6 +7,8 @@
 
 AuthForge is a license key validation service. Your app activates online: it sends a license key + hardware ID to `POST /auth/validate`, and the server checks revocation, expiry, HWID, and credits, then returns a cryptographically signed session. By default the app then runs through the grace period: it keeps running on that signed session without contacting AuthForge until the session TTL expires (default 24h, server clamps to 1h through 7d). Optionally, enable online check-ins (periodic `POST /auth/heartbeat`) for fast revocation and concurrent-use detection. When a check fails (revoked, expired, or grace period over), you handle it (typically exit the app).
 
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `LoginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `Login()` + grace period.
+
 ## Installation
 
 Prefer **`dotnet add package AuthForge`** from [NuGet](https://www.nuget.org/packages/AuthForge/). Targets .NET 6+ (see the `.csproj` for package references such as `BouncyCastle.Cryptography`). You can instead copy `AuthForgeClient.cs` if you truly need a source-only integration and mirror its dependencies yourself.
@@ -87,6 +89,7 @@ new AuthForgeClient(appId, appSecret, publicKey, onlineHeartbeat: true);
 
 - Each `Login()` or `ValidateLicense()` calls `/auth/validate` and costs **1 credit**.
 - Online check-ins cost **1 credit per 10 successful calls** (billed on every 10th heartbeat). The default grace period behavior makes no network calls after activation and costs nothing.
+- **1 offline file mint = 1 credit** (charged to the operator when the file is minted). `LoginFromFile()` / `VerifyLicenseFile()` cost nothing.
 - Keep `heartbeatInterval` at or above 10 seconds. `/auth/heartbeat` is limited to 6 requests/minute per license key; cost still scales with how many check-ins you send.
 - With online check-ins, revocations take effect on the **next** check-in regardless of interval. With the default grace period behavior, a revocation is only noticed at the next online activate/validate.
 
@@ -96,6 +99,11 @@ new AuthForgeClient(appId, appSecret, publicKey, onlineHeartbeat: true);
 |--------|---------|-------------|
 | `Login(string licenseKey)` | `bool` | Activates online, verifies signatures, starts the background thread |
 | `ValidateLicense(string licenseKey)` | `ValidateLicenseResult` | Same validate + signatures as `Login`; no session persistence or background thread; **never** calls `onFailure` or `Environment.Exit` |
+| `LoginFromFile(string pathOrText)` | `bool` | Offline mode: verifies a `.authforge` file locally (no network), authenticates the client, never starts the background thread. Failures -> `onFailure("offline_login_failed", ex)` + `false`; never `Environment.Exit` |
+| `VerifyLicenseFile(string pathOrText, DateTimeOffset? now = null)` | `VerifyLicenseFileResult` | Same offline checks without changing client state |
+| `GetOfflineLicense()` | `OfflineLicense?` | `Jti`, `ExpiresAt`, `HwidPolicy`, … of the offline file in use |
+| `GetSessionKind()` | `SessionKind?` | `SessionKind.Online`, `SessionKind.Offline`, or `null` when logged out |
+| `GetHwid()` | `string` | HWID this client sends; the customer reports it so the operator can mint a bound file |
 | `Logout()` | `void` | Stops the background thread and clears session state |
 | `IsAuthenticated()` | `bool` | Whether a session exists |
 | `GetSessionData()` | `Dictionary<string, object?>?` | Decoded payload map |
@@ -126,6 +134,26 @@ var tier = vars != null && vars.TryGetValue("tier", out var v) ? v : null;
 client.Logout();
 ```
 
+### Offline license file (air-gapped machine, only when asked)
+
+```csharp
+// Step 1 (customer machine): print the HWID so the operator can bind the file to it.
+Console.WriteLine(client.GetHwid());
+
+// Step 2 (operator): mint the .authforge file in the dashboard or via
+// POST /v1/licenses/{licenseKey}/offline-files and deliver it out-of-band.
+
+// Step 3 (customer machine): authorize with the file. No network, no check-ins.
+if (!client.LoginFromFile("license.authforge"))
+{
+    // onFailure already received ("offline_login_failed", ArgumentException(code)) where code is one of
+    // bad_armor | bad_signature | unsupported_version | malformed_payload | wrong_app | expired | hwid_mismatch
+    Environment.Exit(1);
+}
+```
+
+Offline file error codes (in check order): `bad_armor`, `bad_signature`, `unsupported_version`, `malformed_payload`, `wrong_app`, `expired`, `hwid_mismatch`.
+
 ### Custom error handling
 
 Failed validation often surfaces as `ArgumentException` whose message is the server error code (e.g. `invalid_key`). Reasons passed to `onFailure` include `login_failed` and `heartbeat_failed`.
@@ -145,3 +173,11 @@ onFailure: (reason, ex) =>
 - Do not skip `onFailure`: without it, failures call `Environment.Exit(1)` without your cleanup
 - Do not call `Login` on every app action: call once at startup; the grace period or online check-ins handle the rest
 - Do not pass the legacy `heartbeatMode` string in new code: the default already gives you the grace period, and `onlineHeartbeat: true` replaces `"SERVER"`
+- Do not treat the grace period as persistent offline licensing: it is session continuation after one successful online activation, and revocations are only picked up at the next online validate or check-in
+- Do not reach for `LoginFromFile()` unless the user explicitly needs air-gapped / offline-file licensing: the default is online `Login()` + grace period
+- Do not expect an online revoke to disable an offline file that is already on a customer machine: the file stays valid until its own `ExpiresAt`; prefer short expiries and HWID-bound files
+- Do not mint or accept `hwid.mode: "any"` files casually: anyone who copies an unbound file has a working license
+- Do not call `LoginFromFile()` with another app's public key or app id: the file is rejected with `bad_signature` / `wrong_app` by design
+- Do not try to build `.authforge` files client-side: only the AuthForge cloud holds the signing key; there is no BYO issuer
+- Do not call `SelfBan()` or any other online method after `LoginFromFile()`: an offline session has no server session (`GetSessionKind()` is `SessionKind.Offline`), so `SelfBan()` throws `ArgumentException("offline_session")` without contacting the server and online check-ins never start; machines that can reach AuthForge should use online `Login()`
+- Do not bind an offline file to an HWID reported by a different SDK or language: HWID fingerprints are not portable across SDKs, so collect the HWID from the exact SDK build that will load the file (or use the HWID override with an identifier you control)

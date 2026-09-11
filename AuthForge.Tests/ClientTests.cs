@@ -34,6 +34,15 @@ public class ClientTests
     }
 
     [Fact]
+    public void Constructor_EmptyAppSecret_IsAllowed()
+    {
+        var client = new AuthForgeClient("a", "", TestPublicKey, apiBaseUrl: "http://127.0.0.1");
+        Assert.Equal("", client.AppSecret);
+        var empty = Assert.Throws<ArgumentException>(() => client.Login("XXXX-XXXX-XXXX-XXXX"));
+        Assert.Contains("app_secret is required for online APIs", empty.Message);
+    }
+
+    [Fact]
     public void Constructor_OnlineHeartbeatTrue_IsAccepted()
     {
         var client = new AuthForgeClient(

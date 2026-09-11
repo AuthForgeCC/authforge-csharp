@@ -123,7 +123,7 @@ public class OfflineLicenseFileTests
         var failures = new List<(string, string?)>();
         var client = new AuthForgeClient(
             appId: appId ?? good.AppId,
-            appSecret: "unused-offline",
+            appSecret: string.Empty,
             publicKey: publicKey ?? good.PublicKey,
             apiBaseUrl: "http://127.0.0.1:9",
             onFailure: (reason, ex) => failures.Add((reason, ex?.Message)),
@@ -195,7 +195,7 @@ public class OfflineLicenseFileTests
         {
             var client = new AuthForgeClient(
                 appId: good.AppId,
-                appSecret: "unused-offline",
+                appSecret: string.Empty,
                 publicKey: good.PublicKey,
                 apiBaseUrl: prefix.TrimEnd('/'),
                 hwidOverride: good.Hwid);
@@ -224,7 +224,7 @@ public class OfflineLicenseFileTests
         var good = Case(vectors, "good_lifetime");
         var client = new AuthForgeClient(
             appId: good.AppId,
-            appSecret: "unused-offline",
+            appSecret: string.Empty,
             publicKey: good.PublicKey,
             onlineHeartbeat: true,
             heartbeatInterval: 10,

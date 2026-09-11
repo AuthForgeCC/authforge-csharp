@@ -79,6 +79,12 @@ namespace AuthForge
         private readonly string _hwid;
 
         public string AppId { get; }
+        /// <summary>
+        /// Application secret. Required for online APIs
+        /// (<see cref="Login"/>, <see cref="ValidateLicense"/>, <see cref="SelfBan"/>).
+        /// May be empty for offline-only clients (<see cref="LoginFromFile"/>);
+        /// air-gapped builds should not ship the secret.
+        /// </summary>
         public string AppSecret { get; }
         public string PublicKey { get; }
         /// <summary>
@@ -129,7 +135,7 @@ namespace AuthForge
         /// </summary>
         public AuthForgeClient(
             string appId,
-            string appSecret,
+            string? appSecret,
             string publicKey,
             bool onlineHeartbeat = false,
             int heartbeatInterval = 900,
@@ -160,7 +166,7 @@ namespace AuthForge
         [Obsolete("heartbeatMode is deprecated: LOCAL maps to the default grace period behavior (just remove the argument) and SERVER maps to onlineHeartbeat: true.")]
         public AuthForgeClient(
             string appId,
-            string appSecret,
+            string? appSecret,
             string publicKey,
             string heartbeatMode,
             int heartbeatInterval = 900,
@@ -191,7 +197,7 @@ namespace AuthForge
         [Obsolete("heartbeatMode is deprecated: LOCAL maps to the default grace period behavior (just remove the argument) and SERVER maps to onlineHeartbeat: true.")]
         public AuthForgeClient(
             string appId,
-            string appSecret,
+            string? appSecret,
             IEnumerable<string> publicKeys,
             string heartbeatMode,
             int heartbeatInterval = 900,
@@ -236,10 +242,12 @@ namespace AuthForge
         /// the app then runs through the grace period (the session TTL)
         /// without contacting AuthForge. Set <paramref name="onlineHeartbeat"/>
         /// to <c>true</c> to enable online check-ins via <c>/auth/heartbeat</c>.
+        /// <paramref name="appSecret"/> may be empty for offline-only clients
+        /// (<see cref="LoginFromFile"/>); air-gapped builds should not ship it.
         /// </summary>
         public AuthForgeClient(
             string appId,
-            string appSecret,
+            string? appSecret,
             IEnumerable<string> publicKeys,
             bool onlineHeartbeat = false,
             int heartbeatInterval = 900,
@@ -254,10 +262,9 @@ namespace AuthForge
                 throw new ArgumentException("app_id must be a non-empty string", nameof(appId));
             }
 
-            if (string.IsNullOrEmpty(appSecret))
-            {
-                throw new ArgumentException("app_secret must be a non-empty string", nameof(appSecret));
-            }
+            // Empty/null is valid for offline-only clients (LoginFromFile).
+            // Online APIs (Login, ValidateLicense, SelfBan) still require a secret.
+            AppSecret = appSecret ?? string.Empty;
             var keyList = (publicKeys ?? Array.Empty<string>())
                 .Where(k => !string.IsNullOrWhiteSpace(k))
                 .Select(k => k.Trim())
@@ -276,7 +283,6 @@ namespace AuthForge
             }
 
             AppId = appId;
-            AppSecret = appSecret;
             PublicKeys = keyList;
             PublicKey = keyList[0];
             OnlineHeartbeat = onlineHeartbeat;
@@ -329,12 +335,23 @@ namespace AuthForge
                 : new[] { publicKey };
         }
 
+        private void RequireAppSecret()
+        {
+            if (string.IsNullOrEmpty(AppSecret))
+            {
+                throw new ArgumentException(
+                    "app_secret is required for online APIs; omit it only when using LoginFromFile",
+                    nameof(AppSecret));
+            }
+        }
+
         public bool Login(string licenseKey)
         {
             if (string.IsNullOrEmpty(licenseKey))
             {
                 throw new ArgumentException("license_key must be a non-empty string", nameof(licenseKey));
             }
+            RequireAppSecret();
 
             try
             {
@@ -359,6 +376,7 @@ namespace AuthForge
             {
                 throw new ArgumentException("license_key must be a non-empty string", nameof(licenseKey));
             }
+            RequireAppSecret();
 
             try
             {
@@ -471,6 +489,7 @@ namespace AuthForge
             {
                 throw new ArgumentException("missing_license_key");
             }
+            RequireAppSecret();
 
             var preSessionBody = new Dictionary<string, object?>
             {

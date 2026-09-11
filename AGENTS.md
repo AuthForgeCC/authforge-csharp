@@ -7,7 +7,7 @@
 
 AuthForge is a license key validation service. Your app activates online: it sends a license key + hardware ID to `POST /auth/validate`, and the server checks revocation, expiry, HWID, and credits, then returns a cryptographically signed session. By default the app then runs through the grace period: it keeps running on that signed session without contacting AuthForge until the session TTL expires (default 24h, server clamps to 1h through 7d). Optionally, enable online check-ins (periodic `POST /auth/heartbeat`) for fast revocation and concurrent-use detection. When a check fails (revoked, expired, or grace period over), you handle it (typically exit the app).
 
-There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `LoginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `Login()` + grace period.
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `LoginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (pass `""`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `Login()` + grace period.
 
 ## Installation
 
@@ -57,7 +57,7 @@ This activates once online and then runs through the grace period with no furthe
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `appId` | `string` | yes | n/a | Application ID |
-| `appSecret` | `string` | yes | n/a | Application secret |
+| `appSecret` | `string` | for online APIs | n/a | Application secret. Required for `Login` / `ValidateLicense` / `SelfBan`. Pass `""` for `LoginFromFile` only; do not ship it in air-gapped binaries. |
 | `publicKey` | `string` / `IEnumerable<string>` | yes | n/a | Base64 Ed25519 public key from the dashboard (3rd positional arg; no default, so it must be supplied or the call won't compile). The string overload accepts a comma-separated trust list; an `IEnumerable<string>` overload takes a rotation set. The SDK trusts a signature matching **any** key |
 | `onlineHeartbeat` | `bool` | no | `false` | `false`: after activation, run through the grace period locally (no network). `true`: periodic online check-ins via `/auth/heartbeat` for fast revocation and concurrent-use detection |
 | `heartbeatInterval` | `int` | no | `900` | Seconds between background checks (minimum `10`; with online check-ins, revocations apply on the next check-in) |
@@ -170,6 +170,7 @@ onFailure: (reason, ex) =>
 ## Do NOT
 
 - Do not hardcode the app secret as a plain string literal in source: use environment variables or encrypted config
+- Do not embed the App Secret in air-gapped / `LoginFromFile()` builds: pass `""`; verification only needs app id + public key
 - Do not skip `onFailure`: without it, failures call `Environment.Exit(1)` without your cleanup
 - Do not call `Login` on every app action: call once at startup; the grace period or online check-ins handle the rest
 - Do not pass the legacy `heartbeatMode` string in new code: the default already gives you the grace period, and `onlineHeartbeat: true` replaces `"SERVER"`

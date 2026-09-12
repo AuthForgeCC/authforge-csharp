@@ -7,7 +7,7 @@
 
 AuthForge is a license key validation service. Your app activates online: it sends a license key + hardware ID to `POST /auth/validate`, and the server checks revocation, expiry, HWID, and credits, then returns a cryptographically signed session. By default the app then runs through the grace period: it keeps running on that signed session without contacting AuthForge until the session TTL expires (default 24h, server clamps to 1h through 7d). Optionally, enable online check-ins (periodic `POST /auth/heartbeat`) for fast revocation and concurrent-use detection. When a check fails (revoked, expired, or grace period over), you handle it (typically exit the app).
 
-There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `LoginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (pass `""`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `Login()` + grace period.
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `LoginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (pass `""`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `Login()` + grace period. To collect the HWID for a bound file, write an **activation request** (`.authforge-request`) with `CreateActivationRequest`. It is not a license, is not signed, and does not mint anything. Prefer it over printing the raw HWID.
 
 ## Installation
 
@@ -104,6 +104,7 @@ new AuthForgeClient(appId, appSecret, publicKey, onlineHeartbeat: true);
 | `GetOfflineLicense()` | `OfflineLicense?` | `Jti`, `ExpiresAt`, `HwidPolicy`, … of the offline file in use |
 | `GetSessionKind()` | `SessionKind?` | `SessionKind.Online`, `SessionKind.Offline`, or `null` when logged out |
 | `GetHwid()` | `string` | HWID this client sends; the customer reports it so the operator can mint a bound file |
+| `CreateActivationRequest(ActivationRequestOptions? options = null)` | `string` | Unsigned `.authforge-request` for this machine. No network, no secret, callable before `Login()`. Hostname omitted unless `IncludeMachineName` |
 | `Logout()` | `void` | Stops the background thread and clears session state |
 | `IsAuthenticated()` | `bool` | Whether a session exists |
 | `GetSessionData()` | `Dictionary<string, object?>?` | Decoded payload map |

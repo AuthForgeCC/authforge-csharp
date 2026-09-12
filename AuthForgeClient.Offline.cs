@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -45,6 +46,160 @@ namespace AuthForge
         /// an offline <c>.authforge</c> file can be bound to it.
         /// </summary>
         public string GetHwid() => _hwid;
+
+        /// <summary>
+        /// Optional fields for <see cref="CreateActivationRequest"/>.
+        /// <c>MachineName</c> is omitted unless <see cref="ActivationRequestOptions.IncludeMachineName"/> is true.
+        /// </summary>
+        public sealed class ActivationRequestOptions
+        {
+            public bool IncludeMachineName { get; set; }
+            public string? MachineName { get; set; }
+            public string? Os { get; set; }
+            public bool OmitOs { get; set; }
+            public string? Sdk { get; set; }
+            public bool OmitSdk { get; set; }
+            public string? LicenseKey { get; set; }
+            public string? CreatedAt { get; set; }
+        }
+
+        private const int ActivationRequestVersion = 1;
+        private const string ActivationRequestTyp = "authforge-activation-request";
+        private const string BeginActivationRequest = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----";
+        private const string EndActivationRequest = "-----END AUTHFORGE ACTIVATION REQUEST-----";
+        private const string ActivationRequestSdkTag = "csharp/1.2.1";
+        private const int ArmorLineWidth = 64;
+        private const int MaxRequestHwid = 256;
+        private const int MaxRequestMachineName = 128;
+        private const int MaxRequestOs = 64;
+        private const int MaxRequestSdk = 64;
+        private const int MaxRequestLicenseKey = 64;
+
+        private static string ClipRequestField(string value, int max) =>
+            value.Length <= max ? value : value.Substring(0, max);
+
+        private static string JsonEscapeRequest(string value)
+        {
+            var sb = new StringBuilder();
+            sb.Append('"');
+            foreach (var ch in value)
+            {
+                switch (ch)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (ch < 0x20)
+                            sb.Append("\\u00").Append(((int)ch).ToString("x2", CultureInfo.InvariantCulture));
+                        else
+                            sb.Append(ch);
+                        break;
+                }
+            }
+            sb.Append('"');
+            return sb.ToString();
+        }
+
+        private static string WrapArmor64(string value)
+        {
+            var lines = new List<string>();
+            for (var i = 0; i < value.Length; i += ArmorLineWidth)
+            {
+                var len = Math.Min(ArmorLineWidth, value.Length - i);
+                lines.Add(value.Substring(i, len));
+            }
+            return string.Join("\n", lines);
+        }
+
+        private static string DetectOsLabel()
+        {
+            var label = Environment.OSVersion.Platform switch
+            {
+                PlatformID.Win32NT => "Windows " + Environment.OSVersion.Version,
+                PlatformID.Unix => "Linux",
+                PlatformID.MacOSX => "macOS",
+                _ => Environment.OSVersion.ToString()
+            };
+            return ClipRequestField(label, MaxRequestOs);
+        }
+
+        private static string CanonicalActivationRequestJson(
+            string appId, string hwid, string createdAt,
+            string? machineName, string? os, string? sdk, string? licenseKey)
+        {
+            var parts = new List<string>
+            {
+                $"\"v\":{ActivationRequestVersion}",
+                $"\"typ\":{JsonEscapeRequest(ActivationRequestTyp)}",
+                $"\"appId\":{JsonEscapeRequest(appId)}",
+                $"\"hwid\":{JsonEscapeRequest(ClipRequestField(hwid, MaxRequestHwid))}",
+                $"\"createdAt\":{JsonEscapeRequest(createdAt)}"
+            };
+            if (!string.IsNullOrEmpty(machineName))
+                parts.Add($"\"machineName\":{JsonEscapeRequest(ClipRequestField(machineName, MaxRequestMachineName))}");
+            if (!string.IsNullOrEmpty(os))
+                parts.Add($"\"os\":{JsonEscapeRequest(ClipRequestField(os, MaxRequestOs))}");
+            if (!string.IsNullOrEmpty(sdk))
+                parts.Add($"\"sdk\":{JsonEscapeRequest(ClipRequestField(sdk, MaxRequestSdk))}");
+            if (!string.IsNullOrEmpty(licenseKey))
+                parts.Add($"\"licenseKey\":{JsonEscapeRequest(ClipRequestField(licenseKey, MaxRequestLicenseKey))}");
+            return "{" + string.Join(",", parts) + "}";
+        }
+
+        /// <summary>Armored <c>.authforge-request</c> text from explicit fields.</summary>
+        public static string FormatActivationRequest(
+            string appId, string hwid, string createdAt,
+            string? machineName = null, string? os = null, string? sdk = null, string? licenseKey = null)
+        {
+            var json = CanonicalActivationRequestJson(appId, hwid, createdAt, machineName, os, sdk, licenseKey);
+            var payloadB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
+            string checksum;
+            using (var sha = SHA256.Create())
+            {
+                var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(payloadB64));
+                var hex = new StringBuilder(hash.Length * 2);
+                foreach (var b in hash)
+                    hex.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+                checksum = hex.ToString().Substring(0, 16);
+            }
+            var clean = appId.Replace("\r", " ").Replace("\n", " ").Trim();
+            return string.Join("\n", new[]
+            {
+                BeginActivationRequest,
+                $"Version: {ActivationRequestVersion}",
+                "App-Id: " + clean,
+                "Checksum: " + checksum,
+                "",
+                WrapArmor64(payloadB64),
+                EndActivationRequest,
+                ""
+            });
+        }
+
+        /// <summary>
+        /// Build an activation request (<c>.authforge-request</c>) for this machine.
+        /// No network, no session, no app secret. <c>machineName</c> is omitted
+        /// unless <see cref="ActivationRequestOptions.IncludeMachineName"/> is true.
+        /// </summary>
+        public string CreateActivationRequest(ActivationRequestOptions? options = null)
+        {
+            var opts = options ?? new ActivationRequestOptions();
+            var createdAt = string.IsNullOrEmpty(opts.CreatedAt)
+                ? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture) + "Z"
+                : opts.CreatedAt;
+            string? machineName = null;
+            if (opts.IncludeMachineName)
+                machineName = string.IsNullOrEmpty(opts.MachineName) ? Environment.MachineName : opts.MachineName;
+            string? os = opts.OmitOs ? null : (string.IsNullOrEmpty(opts.Os) ? DetectOsLabel() : opts.Os);
+            string? sdk = opts.OmitSdk ? null : (string.IsNullOrEmpty(opts.Sdk) ? ActivationRequestSdkTag : opts.Sdk);
+            string? licenseKey = opts.LicenseKey ?? _licenseKey;
+            return FormatActivationRequest(AppId, _hwid, createdAt!, machineName, os, sdk, licenseKey);
+        }
 
         /// <summary>
         /// Authorize from a cloud-minted offline license file (<c>.authforge</c>)

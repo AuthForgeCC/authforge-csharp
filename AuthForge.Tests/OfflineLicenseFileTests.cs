@@ -310,4 +310,61 @@ public class OfflineLicenseFileTests
             dir.Delete(recursive: true);
         }
     }
+
+    private sealed class ActivationRequestVectors
+    {
+        public List<ActivationRequestCase> Cases { get; set; } = new();
+    }
+
+    private sealed class ActivationRequestCase
+    {
+        public string Name { get; set; } = string.Empty;
+        public string File { get; set; } = string.Empty;
+        public ActivationRequestInputs? Inputs { get; set; }
+    }
+
+    private sealed class ActivationRequestInputs
+    {
+        public string AppId { get; set; } = string.Empty;
+        public string Hwid { get; set; } = string.Empty;
+        public string CreatedAt { get; set; } = string.Empty;
+        public string? MachineName { get; set; }
+        public string? Os { get; set; }
+        public string? Sdk { get; set; }
+        public string? LicenseKey { get; set; }
+    }
+
+    [Fact]
+    public void CreateActivationRequest_Matches_Vectors()
+    {
+        var json = File.ReadAllText("activation_request_vectors.json");
+        var vectors = JsonSerializer.Deserialize<ActivationRequestVectors>(json, Options)!;
+        const string dummyKey = "0wRcYWn44wk9tHOisXgso1wbtUqpFdy0IeMk4HXDiNc=";
+        foreach (var c in vectors.Cases)
+        {
+            if (c.Inputs is null) continue;
+            var client = new AuthForgeClient(
+                appId: c.Inputs.AppId,
+                appSecret: string.Empty,
+                publicKey: dummyKey,
+                hwidOverride: c.Inputs.Hwid);
+            var got = client.CreateActivationRequest(new AuthForgeClient.ActivationRequestOptions
+            {
+                CreatedAt = c.Inputs.CreatedAt,
+                OmitOs = string.IsNullOrEmpty(c.Inputs.Os),
+                OmitSdk = string.IsNullOrEmpty(c.Inputs.Sdk),
+                IncludeMachineName = !string.IsNullOrEmpty(c.Inputs.MachineName),
+                MachineName = c.Inputs.MachineName,
+                Os = c.Inputs.Os,
+                Sdk = c.Inputs.Sdk,
+                LicenseKey = c.Inputs.LicenseKey ?? ""
+            });
+            Assert.Equal(c.File, got);
+            Assert.Equal(
+                c.File,
+                AuthForgeClient.FormatActivationRequest(
+                    c.Inputs.AppId, c.Inputs.Hwid, c.Inputs.CreatedAt,
+                    c.Inputs.MachineName, c.Inputs.Os, c.Inputs.Sdk, c.Inputs.LicenseKey));
+        }
+    }
 }

@@ -147,8 +147,8 @@ var client = new AuthForgeClient(
     publicKey: "YOUR_PUBLIC_KEY",
     onFailure: (reason, ex) => Console.Error.WriteLine($"{reason}: {ex?.Message}"));
 
-// 1. The customer sends you this value so you can bind the file to their machine:
-Console.WriteLine($"HWID: {client.GetHwid()}");
+// 1. Write an activation request the operator drops into the mint dialog:
+File.WriteAllText("machine.authforge-request", client.CreateActivationRequest());
 
 // 2. Later, authorize from the minted file (path or armored text). No network.
 if (client.LoginFromFile("license.authforge"))
@@ -202,6 +202,7 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 | `GetOfflineLicense()` | `OfflineLicense?` | Metadata of the offline file in use (`Jti`, `ExpiresAt`, `HwidPolicy`, …) |
 | `GetSessionKind()` | `SessionKind?` | `SessionKind.Online`, `SessionKind.Offline`, or `null` when logged out |
 | `GetHwid()` | `string` | The HWID this client sends (or `hwidOverride`); customers share it to receive a bound file |
+| `CreateActivationRequest(ActivationRequestOptions? options = null)` | `string` | Unsigned `.authforge-request` for this machine. No network, no secret. Hostname omitted unless `IncludeMachineName` |
 | `Logout()` | `void` | Stops the background thread and clears all session/auth state |
 | `IsAuthenticated()` | `bool` | True when an active authenticated session exists |
 | `GetSessionData()` | `Dictionary<string, object?>?` | Full decoded payload map |

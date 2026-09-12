@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Xunit;
 
@@ -332,6 +333,33 @@ public class OfflineLicenseFileTests
         public string? Os { get; set; }
         public string? Sdk { get; set; }
         public string? LicenseKey { get; set; }
+    }
+
+    [Fact]
+    public void ActivationRequestSdkTag_MatchesCsprojVersion()
+    {
+        var field = typeof(AuthForgeClient).GetField(
+            "ActivationRequestSdkTag",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(field);
+        var tag = (string)field!.GetValue(null)!;
+
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        string? csproj = null;
+        while (dir != null)
+        {
+            var candidate = Path.Combine(dir.FullName, "AuthForge.csproj");
+            if (File.Exists(candidate))
+            {
+                csproj = File.ReadAllText(candidate);
+                break;
+            }
+            dir = dir.Parent;
+        }
+        Assert.False(string.IsNullOrEmpty(csproj), "AuthForge.csproj not found");
+        var match = Regex.Match(csproj!, @"<Version>([0-9]+\.[0-9]+\.[0-9]+)</Version>");
+        Assert.True(match.Success, "csproj <Version> not found");
+        Assert.Equal("csharp/" + match.Groups[1].Value, tag);
     }
 
     [Fact]

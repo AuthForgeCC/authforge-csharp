@@ -8,6 +8,7 @@ using Xunit;
 
 namespace AuthForge.Tests;
 
+[Collection(TestNonceCollection.Name)]
 public class ClientTests
 {
     private static readonly BindingFlags StaticNonPublic = BindingFlags.Static | BindingFlags.NonPublic;

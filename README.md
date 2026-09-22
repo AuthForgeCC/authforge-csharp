@@ -36,7 +36,7 @@ The package is **`AuthForge`** on [NuGet](https://www.nuget.org/packages/AuthFor
 dotnet add package AuthForge
 ```
 
-**Alternative:** copy `AuthForgeClient.cs` into your solution if you need a source-only vendored layout (you still need the same NuGet dependencies declared in your project).
+**Alternative:** copy `AuthForgeClient.cs`, `AuthForgeClient.Offline.cs` and `AuthForgeException.cs` into your solution if you need a source-only vendored layout (you still need the same NuGet dependencies declared in your project).
 
 ## Quick Start
 
@@ -216,12 +216,30 @@ If authentication fails, the SDK calls your `onFailure` callback if one is provi
 **`ValidateLicense()`** returns a result object instead; it does not invoke `onFailure` or exit for validate/network failures.
 
 Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `system_error`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `demo_quota_exceeded`, `server_error`, `system_error`. Codes added to the server later are passed through unchanged.
 
 Request retries are automatic inside the internal HTTP layer:
-- `rate_limited`: retry after 2s, then 5s (max 3 attempts total)
+- `rate_limited`, or HTTP 429 with no error code: retry after 2s, then 5s (max 3 attempts total). HTTP 429 with `no_credits`, `app_burn_cap_reached` or `demo_quota_exceeded` is not retried.
 - network failure: retry once after 2s
 - every retry regenerates a fresh nonce
+
+### Background check failures
+
+Background check failures reach `onFailure("heartbeat_failed", ex)`, where `ex` is an `AuthForgeException`:
+
+- `ex.Code`: the server's error code from the response body, whatever the HTTP status, or an SDK code: `network_error`, `timeout`, `http_error_<status>` (non-JSON error body), `invalid_json_response`, `unexpected_response`, `signature_mismatch`, `nonce_mismatch`, .... For server codes `ex.Message` equals the code; network failures keep the `url_error: ...` message.
+- `ex.IsTransient` / `ex.IsFatal`: the classification. `AuthForgeClient.IsTransientError(code)` is the same check, and `AuthForgeClient.DefinitiveErrorCodes` lists the fatal codes.
+
+| Kind | Codes | What the SDK does |
+|---|---|---|
+| Fatal | `revoked`, `expired`, `hwid_mismatch` (the HWID is no longer bound, for example after an HWID reset), `blocked` (HWID/IP blacklisted or not whitelisted), `session_expired` (also the grace period ending), `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` | Clears the stored session (as `Logout()` does) and stops background checks **before** calling `onFailure`, so `IsAuthenticated()` is `false`. `onFailure` may call `Login()` again. |
+| Transient | Everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `server_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, `http_error_<status>`, `unexpected_response`, unknown codes | Keeps the session and checks in again on the next `heartbeatInterval`. Once the signed session's TTL has passed, the next transient failure is reported as a fatal `session_expired` instead. |
+
+`unexpected_response` means a failed check-in body was not a well-formed AuthForge verdict (`{"status":"failed","error":"<code>"}`), for example a proxy or captive portal answering instead of AuthForge; the message includes the raw `status` and `error` values.
+
+Transient failures only keep checking in if `onFailure` returns normally. Without a callback, any failure still calls `Environment.Exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
+
+To tolerate short outages but exit on a definitive answer:
 
 ```csharp
 var client = new AuthForgeClient(
@@ -229,15 +247,24 @@ var client = new AuthForgeClient(
     appSecret: "YOUR_APP_SECRET",
     publicKey: "YOUR_PUBLIC_KEY",
     onlineHeartbeat: true,
-    onFailure: (reason, exception) =>
+    ttlSeconds: 3600, // retry window for transient check-in failures
+    onFailure: (reason, ex) =>
     {
-        Console.WriteLine($"Auth failed: {reason}");
-        if (exception != null)
-            Console.WriteLine($"Details: {exception.Message}");
+        if (ex is AuthForgeException { IsTransient: true } transient)
+        {
+            // Connectivity problem or AuthForge overloaded: keep running. The SDK
+            // checks in again every heartbeatInterval and reports session_expired
+            // (fatal) once the ttlSeconds grace period is used up.
+            Console.Error.WriteLine($"AuthForge check-in failed ({transient.Code}), retrying");
+            return;
+        }
+        Console.Error.WriteLine($"License check failed: {reason} ({(ex as AuthForgeException)?.Code ?? ex?.Message})");
         Environment.Exit(1);
     }
 );
 ```
+
+**Thread safety**: `onFailure` for `heartbeat_failed` runs on the background thread with no SDK lock held. Calling `Logout()`, `IsAuthenticated()` or `Login()` from it is safe; `Logout()` signals the thread to stop and never waits for it. A check-in response that arrives after `Logout()` or a new `Login()` is discarded, so it cannot restore the old session.
 
 ## Self-ban (tamper response)
 

@@ -10,6 +10,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Org.BouncyCastle.Crypto.Parameters;
@@ -55,13 +56,42 @@ namespace AuthForge
             "revoke_requires_session",
             "bad_request",
             "malformed_request",
+            "demo_quota_exceeded",
             "server_error",
             "system_error",
         };
+        private static readonly Regex ServerErrorCodeRegex = new Regex("^[a-z][a-z0-9_]{0,63}$", RegexOptions.CultureInvariant);
+        private static readonly string[] DefinitiveErrorCodeList =
+        {
+            "revoked",
+            "expired",
+            "hwid_mismatch",
+            "blocked",
+            "session_expired",
+            "malformed_request",
+            "app_disabled",
+            "invalid_app",
+            "signature_mismatch",
+        };
+        private static readonly HashSet<string> DefinitiveErrorCodeSet = new HashSet<string>(DefinitiveErrorCodeList, StringComparer.Ordinal);
+
+        /// <summary>
+        /// Codes that are an AuthForge verdict on the session or license. Every
+        /// other code (network, timeout, <c>http_error_N</c>, <c>rate_limited</c>,
+        /// <c>no_credits</c>, <c>unexpected_response</c>, unknown codes, ...) is transient.
+        /// </summary>
+        public static IReadOnlyCollection<string> DefinitiveErrorCodes { get; } = Array.AsReadOnly(DefinitiveErrorCodeList);
+
+        /// <summary>True unless <paramref name="code"/> is in <see cref="DefinitiveErrorCodes"/>.</summary>
+        public static bool IsTransientError(string? code)
+        {
+            return code is null || !DefinitiveErrorCodeSet.Contains(code);
+        }
 
         private Thread? _heartbeatThread;
         private bool _heartbeatStarted;
-        private bool _heartbeatStop;
+        private ManualResetEventSlim? _heartbeatStopSignal;
+        private int _sessionGeneration;
 
         private string? _licenseKey;
         private string? _sessionToken;
@@ -521,9 +551,10 @@ namespace AuthForge
                     return;
                 }
 
-                _heartbeatStop = false;
+                var stopSignal = new ManualResetEventSlim(false);
+                _heartbeatStopSignal = stopSignal;
                 _heartbeatStarted = true;
-                _heartbeatThread = new Thread(HeartbeatLoop)
+                _heartbeatThread = new Thread(() => HeartbeatLoop(stopSignal))
                 {
                     Name = "AuthForgeHeartbeat",
                     IsBackground = true,
@@ -532,38 +563,101 @@ namespace AuthForge
             }
         }
 
-        private void HeartbeatLoop()
+        private void HeartbeatLoop(ManualResetEventSlim stopSignal)
         {
-            while (true)
+            var interval = TimeSpan.FromSeconds(HeartbeatInterval);
+            while (!stopSignal.Wait(interval))
             {
-                Thread.Sleep(TimeSpan.FromSeconds(HeartbeatInterval));
-                lock (_lock)
+                if (!HeartbeatTick())
                 {
-                    if (_heartbeatStop)
-                    {
-                        break;
-                    }
-                }
-                try
-                {
-                    if (OnlineHeartbeat)
-                    {
-                        ServerHeartbeat();
-                    }
-                    else
-                    {
-                        GracePeriodCheck();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Fail("heartbeat_failed", ex);
                     break;
                 }
             }
         }
 
-        private void ServerHeartbeat()
+        /// <summary>
+        /// Runs one background check. Transient failures keep the session and
+        /// return <c>true</c> so check-ins continue. Definitive failures clear
+        /// the session before <see cref="OnFailure"/> runs and return <c>false</c>.
+        /// A result for a session that was replaced or logged out meanwhile is dropped.
+        /// </summary>
+        internal bool HeartbeatTick()
+        {
+            int generation;
+            lock (_lock)
+            {
+                if (_sessionKind != SessionKind.Online)
+                {
+                    return false;
+                }
+                generation = _sessionGeneration;
+            }
+
+            AuthForgeException failure;
+            try
+            {
+                if (OnlineHeartbeat)
+                {
+                    ServerHeartbeat(generation);
+                }
+                else
+                {
+                    GracePeriodCheck();
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                failure = NormalizeHeartbeatError(ex);
+            }
+
+            lock (_lock)
+            {
+                if (generation != _sessionGeneration)
+                {
+                    return _sessionKind == SessionKind.Online;
+                }
+                if (failure.IsTransient && LocalSessionExpiredLocked())
+                {
+                    failure = new AuthForgeException("session_expired", "session_expired", failure);
+                }
+                if (failure.IsFatal)
+                {
+                    ClearSessionLocked();
+                }
+            }
+
+            Fail("heartbeat_failed", failure);
+            return failure.IsTransient;
+        }
+
+        internal static AuthForgeException NormalizeHeartbeatError(Exception ex)
+        {
+            if (ex is AuthForgeException authForgeException)
+            {
+                return authForgeException;
+            }
+            var message = ex.Message ?? string.Empty;
+            if (ex.InnerException is TaskCanceledException)
+            {
+                return new AuthForgeException("timeout", message, ex);
+            }
+            var prefix = message.Split(':')[0].Trim().ToLowerInvariant();
+            if (prefix == "url_error")
+            {
+                return new AuthForgeException("network_error", message, ex);
+            }
+            var code = ServerErrorCodeRegex.IsMatch(prefix) ? prefix : "unknown_error";
+            return new AuthForgeException(code, message, ex);
+        }
+
+        private bool LocalSessionExpiredLocked()
+        {
+            return _sessionExpiresIn.HasValue
+                && DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= _sessionExpiresIn.Value;
+        }
+
+        private void ServerHeartbeat(int generation)
         {
             string? sessionToken;
             string hwid;
@@ -573,7 +667,7 @@ namespace AuthForge
                 hwid = _hwid;
             }
 
-            if (string.IsNullOrEmpty(sessionToken))
+            if (sessionToken is null || sessionToken.Length == 0)
             {
                 throw new InvalidOperationException("missing_session_token");
             }
@@ -585,9 +679,41 @@ namespace AuthForge
                 ["nonce"] = GenerateNonce(),
                 ["hwid"] = hwid,
             };
-            var responseObj = PostJson("/auth/heartbeat", body);
+            var responseObj = PostJson("/auth/heartbeat", body, skipFailureOnNetwork: true);
+            responseObj.TryGetValue("status", out var statusElement);
+            if (!IsSuccessStatus(statusElement))
+            {
+                throw HeartbeatRejection(responseObj);
+            }
             var expectedNonce = body.TryGetValue("nonce", out var usedNonce) ? (usedNonce?.ToString() ?? string.Empty) : string.Empty;
-            ApplySignedResponse(responseObj, expectedNonce, null, "heartbeat");
+            ApplySignedResponse(responseObj, expectedNonce, null, "heartbeat", generation);
+        }
+
+        /// <summary>
+        /// A failed heartbeat body is an AuthForge verdict only when it is
+        /// <c>{"status":"failed","error":"&lt;code&gt;"}</c>; anything else is
+        /// <c>unexpected_response</c> (transient).
+        /// </summary>
+        private AuthForgeException HeartbeatRejection(Dictionary<string, JsonElement> responseObj)
+        {
+            responseObj.TryGetValue("status", out var statusElement);
+            responseObj.TryGetValue("error", out var errorElement);
+            var wellFormed = statusElement.ValueKind == JsonValueKind.String
+                && string.Equals((statusElement.GetString() ?? string.Empty).Trim(), "failed", StringComparison.OrdinalIgnoreCase)
+                && errorElement.ValueKind == JsonValueKind.String
+                && (errorElement.GetString() ?? string.Empty).Trim().Length > 0;
+            if (wellFormed)
+            {
+                return new AuthForgeException(ExtractServerError(responseObj));
+            }
+            return new AuthForgeException(
+                "unexpected_response",
+                $"unexpected_response: status={DescribeJson(statusElement)}, error={DescribeJson(errorElement)}");
+        }
+
+        private static string DescribeJson(JsonElement element)
+        {
+            return element.ValueKind == JsonValueKind.Undefined ? "<missing>" : element.GetRawText();
         }
 
         /// <summary>
@@ -625,7 +751,7 @@ namespace AuthForge
             {
                 return;
             }
-            throw new InvalidOperationException("session_expired");
+            throw new AuthForgeException("session_expired");
         }
 
         private void ValidateAndStore(string licenseKey)
@@ -756,17 +882,33 @@ namespace AuthForge
             };
         }
 
+        /// <summary>
+        /// Stores a verified session. With <paramref name="expectedGeneration"/>
+        /// (heartbeat refresh) the write is skipped if the session was logged out
+        /// or replaced since the request started; without it (validate) a new
+        /// session generation begins.
+        /// </summary>
         private void ApplySignedResponse(
             Dictionary<string, JsonElement> responseObj,
             string expectedNonce,
             string? licenseKey,
-            string context)
+            string context,
+            int? expectedGeneration = null)
         {
             var parsed = ParseSignedValidateResponse(responseObj, expectedNonce);
             _ = context;
 
             lock (_lock)
             {
+                if (expectedGeneration is null)
+                {
+                    _sessionGeneration++;
+                }
+                else if (expectedGeneration.Value != _sessionGeneration)
+                {
+                    return;
+                }
+
                 if (licenseKey is not null)
                 {
                     _licenseKey = licenseKey;
@@ -823,53 +965,47 @@ namespace AuthForge
                     {
                         parsed = ParseResponseObject(rawResponse);
                     }
-                    catch
+                    catch (Exception ex)
                     {
                         if (statusCode >= 400)
                         {
-                            throw new InvalidOperationException($"http_error_{statusCode}");
+                            throw new AuthForgeException($"http_error_{statusCode}", $"http_error_{statusCode}", ex);
                         }
                         throw;
                     }
-                    var isRateLimited = statusCode == 429 || ExtractServerError(parsed) == "rate_limited";
+                    // no_credits / app_burn_cap_reached / demo_quota_exceeded also use
+                    // HTTP 429 but are not worth retrying; only retry a genuine rate limit.
+                    var serverError = ExtractServerError(parsed);
+                    var isRateLimited = serverError == "rate_limited"
+                        || (statusCode == 429 && serverError == "unknown_error");
                     if (isRateLimited && rateAttempt < rateRetryDelays.Length)
                     {
-                        Thread.Sleep(TimeSpan.FromSeconds(rateRetryDelays[rateAttempt]));
+                        SleepFn(TimeSpan.FromSeconds(rateRetryDelays[rateAttempt]));
                         rateAttempt++;
                         continue;
                     }
                     return parsed;
                 }
-                catch (HttpRequestException ex)
+                catch (Exception ex) when (ex is HttpRequestException || ex is TaskCanceledException)
                 {
                     if (!networkRetried)
                     {
                         networkRetried = true;
-                        Thread.Sleep(TimeSpan.FromSeconds(2));
+                        SleepFn(TimeSpan.FromSeconds(2));
                         continue;
                     }
                     if (!skipFailureOnNetwork)
                     {
                         Fail("network_error", ex);
                     }
-                    throw new InvalidOperationException($"url_error: {ex.Message}", ex);
-                }
-                catch (TaskCanceledException ex)
-                {
-                    if (!networkRetried)
-                    {
-                        networkRetried = true;
-                        Thread.Sleep(TimeSpan.FromSeconds(2));
-                        continue;
-                    }
-                    if (!skipFailureOnNetwork)
-                    {
-                        Fail("network_error", ex);
-                    }
-                    throw new InvalidOperationException($"url_error: {ex.Message}", ex);
+                    var code = ex is TaskCanceledException ? "timeout" : "network_error";
+                    throw new AuthForgeException(code, $"url_error: {ex.Message}", ex);
                 }
             }
         }
+
+        /// <summary>Delay used between request retries; replaceable in tests.</summary>
+        internal Action<TimeSpan> SleepFn { get; set; } = Thread.Sleep;
 
         private static Dictionary<string, JsonElement> ParseResponseObject(string rawResponse)
         {
@@ -1241,7 +1377,7 @@ namespace AuthForge
             if (responseObj.TryGetValue("error", out var errorElement))
             {
                 var error = (errorElement.ToString() ?? string.Empty).Trim().ToLowerInvariant();
-                if (_knownServerErrors.Contains(error))
+                if (_knownServerErrors.Contains(error) || ServerErrorCodeRegex.IsMatch(error))
                 {
                     return error;
                 }
@@ -1259,27 +1395,39 @@ namespace AuthForge
             return "unknown_error";
         }
 
+        /// <summary>
+        /// Stops the background thread and clears all session state. Safe to
+        /// call from <see cref="OnFailure"/> (including on the heartbeat thread):
+        /// it signals the thread to stop and never waits for it.
+        /// </summary>
         public void Logout()
         {
             lock (_lock)
             {
-                _heartbeatStop = true;
-                _heartbeatStarted = false;
-                _heartbeatThread = null;
-                _licenseKey = null;
-                _sessionToken = null;
-                _sessionExpiresIn = null;
-                _lastNonce = null;
-                _rawPayloadB64 = null;
-                _signature = null;
-                _keyId = null;
-                _sessionData = null;
-                _appVariables = null;
-                _licenseVariables = null;
-                _authenticated = false;
-                _sessionKind = null;
-                _offlineLicense = null;
+                ClearSessionLocked();
             }
+        }
+
+        private void ClearSessionLocked()
+        {
+            _sessionGeneration++;
+            _heartbeatStopSignal?.Set();
+            _heartbeatStopSignal = null;
+            _heartbeatStarted = false;
+            _heartbeatThread = null;
+            _licenseKey = null;
+            _sessionToken = null;
+            _sessionExpiresIn = null;
+            _lastNonce = null;
+            _rawPayloadB64 = null;
+            _signature = null;
+            _keyId = null;
+            _sessionData = null;
+            _appVariables = null;
+            _licenseVariables = null;
+            _authenticated = false;
+            _sessionKind = null;
+            _offlineLicense = null;
         }
 
         public bool IsAuthenticated()

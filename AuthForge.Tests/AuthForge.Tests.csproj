@@ -22,6 +22,7 @@
   <ItemGroup>
     <Compile Include="..\AuthForgeClient.cs" Link="AuthForgeClient.cs" />
     <Compile Include="..\AuthForgeClient.Offline.cs" Link="AuthForgeClient.Offline.cs" />
+    <Compile Include="..\AuthForgeException.cs" Link="AuthForgeException.cs" />
   </ItemGroup>
 
   <ItemGroup>

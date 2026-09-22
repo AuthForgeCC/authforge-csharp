@@ -11,7 +11,7 @@ There is also a **separate** mode for machines that can never reach the internet
 
 ## Installation
 
-Prefer **`dotnet add package AuthForge`** from [NuGet](https://www.nuget.org/packages/AuthForge/). Targets .NET 6+ (see the `.csproj` for package references such as `BouncyCastle.Cryptography`). You can instead copy `AuthForgeClient.cs` if you truly need a source-only integration and mirror its dependencies yourself.
+Prefer **`dotnet add package AuthForge`** from [NuGet](https://www.nuget.org/packages/AuthForge/). Targets .NET 6+ (see the `.csproj` for package references such as `BouncyCastle.Cryptography`). You can instead copy `AuthForgeClient.cs`, `AuthForgeClient.Offline.cs` and `AuthForgeException.cs` if you truly need a source-only integration and mirror its dependencies yourself.
 
 ## Minimal working integration
 
@@ -113,12 +113,39 @@ new AuthForgeClient(appId, appSecret, publicKey, onlineHeartbeat: true);
 
 ## Error codes the server can return
 
-Full set: invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, app_burn_cap_reached, blocked, rate_limited, replay_detected, app_disabled, session_expired, revoke_requires_session, bad_request, malformed_request, system_error
+Full set: invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, app_burn_cap_reached, blocked, rate_limited, replay_detected, app_disabled, session_expired, revoke_requires_session, bad_request, malformed_request, demo_quota_exceeded, server_error, system_error. Unknown lowercase snake_case codes are passed through unchanged (e.g. in `ValidateLicenseResult.ErrorCode`).
 
 Notes:
 - `replay_detected` is validate-only. `rate_limited` can be returned by `/auth/validate` and `/auth/heartbeat` (heartbeat is license-limited at 6/min and has no app-layer IP limit).
 - `app_burn_cap_reached` means the app's configured credit burn cap is hit; `revoke_requires_session` means a pre-session self-ban tried to revoke a license (only session-authenticated self-ban can revoke).
 - `session_expired` from the background thread means the grace period ended; call `Login` again to re-activate.
+- Retries: only `rate_limited` (or HTTP 429 with no error code) is retried, after 2s then 5s. `no_credits`, `app_burn_cap_reached` and `demo_quota_exceeded` (also HTTP 429) fail immediately. Network failures retry once after 2s.
+
+## Failure Handling
+
+Background check failures call `onFailure("heartbeat_failed", ex)` with `ex` an `AuthForgeException` (`Code`, `IsTransient`, `IsFatal`). For server codes `ex.Message == ex.Code`; network failures keep the `url_error: ...` message. `AuthForgeClient.IsTransientError(code)` and `AuthForgeClient.DefinitiveErrorCodes` expose the same classification.
+
+| Kind | Codes | SDK behavior |
+|---|---|---|
+| Fatal | `revoked`, `expired`, `hwid_mismatch`, `blocked`, `session_expired`, `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` | Clears the session (as `Logout()`) and stops background checks before `onFailure`; `IsAuthenticated()` is `false` |
+| Transient | everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `server_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, `http_error_<status>`, `unexpected_response`, unknown codes | Keeps the session and checks in again next interval; after the session TTL has passed it is reported as fatal `session_expired` |
+
+- `hwid_mismatch` on a check-in: this HWID is no longer bound to the license (for example after an HWID reset in the dashboard).
+- `blocked` on a check-in: the HWID or IP is blacklisted, or not on the app's whitelist.
+- `unexpected_response`: the failed body was not a well-formed verdict (`{"status":"failed","error":"<code>"}`), e.g. a proxy answered; the message carries the raw `status` / `error`.
+- Heartbeat network failures are reported once (`heartbeat_failed` with `network_error` / `timeout`), not also as `network_error`.
+- Transient failures keep checking in only if `onFailure` returns; without a callback every failure calls `Environment.Exit(1)`.
+- Thread safety: `onFailure` for `heartbeat_failed` runs on the heartbeat thread with no SDK lock held. Calling `Logout()` / `IsAuthenticated()` (or `Login()`) from it is safe; `Logout()` never waits for the thread. A late check-in response after `Logout()` / `Login()` is discarded.
+
+```csharp
+onFailure: (reason, ex) =>
+{
+    if (ex is AuthForgeException { IsTransient: true })
+        return; // outage or overload: keep running, the SDK checks in again
+    Console.Error.WriteLine($"AuthForge: {reason} ({(ex as AuthForgeException)?.Code ?? ex?.Message})");
+    Environment.Exit(1);
+}
+```
 
 ## Common patterns
 
@@ -157,13 +184,16 @@ Offline file error codes (in check order): `bad_armor`, `bad_signature`, `unsupp
 
 ### Custom error handling
 
-Failed validation often surfaces as `ArgumentException` whose message is the server error code (e.g. `invalid_key`). Reasons passed to `onFailure` include `login_failed` and `heartbeat_failed`.
+Reasons passed to `onFailure` include `login_failed` and `heartbeat_failed`. For `login_failed`, a server rejection surfaces as `ArgumentException` whose message is the server error code (e.g. `invalid_key`); network and HTTP errors are `AuthForgeException` (`network_error`, `timeout`, `http_error_<status>`). For `heartbeat_failed` it is always an `AuthForgeException` (see [Failure Handling](#failure-handling)).
 
 ```csharp
 onFailure: (reason, ex) =>
 {
-    if (ex is ArgumentException ae && ae.Message is "invalid_key" or "expired" or "revoked")
-        Console.Error.WriteLine($"License: {ae.Message}");
+    if (reason == "heartbeat_failed" && ex is AuthForgeException { IsTransient: true })
+        return;
+    var code = ex is AuthForgeException afe ? afe.Code : ex?.Message;
+    if (code is "invalid_key" or "expired" or "revoked")
+        Console.Error.WriteLine($"License: {code}");
     Environment.Exit(1);
 }
 ```

@@ -211,7 +211,7 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 
 ## Failure Handling
 
-If authentication fails, the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `Environment.Exit(1)` to terminate the process.** This is intentional: it prevents your app from running without a valid license.
+If authentication fails, the SDK calls your `onFailure` callback if one is provided. Without a callback, a transient background check failure (network outage, `rate_limited`, `system_error`, ...) writes a one-line warning to stderr and check-ins continue; every other failure (a rejected `Login`, a definitive check-in answer, the grace period running out) **calls `Environment.Exit(1)` to terminate the process**, so your app cannot keep running without a valid license. `Environment.Exit` does not give your code a chance to save, so set `onFailure` if your app has anything to save.
 
 **`ValidateLicense()`** returns a result object instead; it does not invoke `onFailure` or exit for validate/network failures.
 
@@ -237,11 +237,13 @@ Background check failures reach `onFailure("heartbeat_failed", ex)`, where `ex` 
 
 `unexpected_response` means a failed check-in body was not a well-formed AuthForge verdict (`{"status":"failed","error":"<code>"}`), for example a proxy or captive portal answering instead of AuthForge; the message includes the raw `status` and `error` values.
 
-Transient failures only keep checking in if `onFailure` returns normally. Without a callback, any failure still calls `Environment.Exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
+Transient failures only keep checking in if `onFailure` returns normally. Without a callback, a transient failure prints `AuthForge: background check failed (<code>); retrying next interval` to stderr and check-ins continue; a fatal one, including the `session_expired` a transient failure becomes once the session TTL has passed, still calls `Environment.Exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
 
-To tolerate short outages but exit on a definitive answer:
+To tolerate short outages but shut down on a definitive answer, have the callback signal your main thread and let the main thread save and exit:
 
 ```csharp
+using var licenseLost = new CancellationTokenSource();
+
 var client = new AuthForgeClient(
     appId: "YOUR_APP_ID",
     appSecret: "YOUR_APP_SECRET",
@@ -259,10 +261,27 @@ var client = new AuthForgeClient(
             return;
         }
         Console.Error.WriteLine($"License check failed: {reason} ({(ex as AuthForgeException)?.Code ?? ex?.Message})");
-        Environment.Exit(1);
+        // This can run on the heartbeat thread: signal the main thread instead of exiting here.
+        licenseLost.Cancel();
     }
 );
+
+if (!client.Login(licenseKey))
+{
+    return 1;
+}
+
+while (!licenseLost.IsCancellationRequested)
+{
+    DoOneUnitOfWork(licenseLost.Token); // keep units short, or pass the token to async work
+}
+
+SaveUserWork();
+client.Logout();
+return 1;
 ```
+
+In a WinForms or WPF app, marshal to the UI thread instead (`form.BeginInvoke(...)` or `Dispatcher.InvokeAsync(...)`) and close the main window normally. Calling `Environment.Exit(1)` inside `onFailure` is a last resort: `finally` blocks on other threads do not run and unsaved state is lost, so save the user's work first.
 
 **Thread safety**: `onFailure` for `heartbeat_failed` runs on the background thread with no SDK lock held. Calling `Logout()`, `IsAuthenticated()` or `Login()` from it is safe; `Logout()` signals the thread to stop and never waits for it. A check-in response that arrives after `Logout()` or a new `Login()` is discarded, so it cannot restore the old session.
 

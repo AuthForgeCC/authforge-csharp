@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.1
+
+### Fixes
+
+- **No more exit on transient failures without a callback.** Without `onFailure`, a transient background check failure (network outage, timeout, `rate_limited`, `system_error`, `no_credits`, ...) no longer calls `Environment.Exit(1)`. The SDK writes one line to stderr, `AuthForge: background check failed (<code>); retrying next interval`, keeps the session and checks in again on the next interval. Previously a brief outage killed any app that enabled online check-ins without setting a callback.
+- Unchanged: without a callback, definitive failures (including the `session_expired` a transient failure becomes once the session TTL has passed) and failed `Login` calls still call `Environment.Exit(1)`.
+
+### Docs
+
+- The README and `AGENTS.md` examples no longer call `Environment.Exit(1)` from `onFailure`. They cancel a `CancellationTokenSource` that the main loop watches, so it can save work and exit; `Environment.Exit` is kept as a last resort after saving.
+
 ## 1.4.0
 
 ### Behavior changes for callers

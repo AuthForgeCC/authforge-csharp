@@ -577,7 +577,8 @@ namespace AuthForge
 
         /// <summary>
         /// Runs one background check. Transient failures keep the session and
-        /// return <c>true</c> so check-ins continue. Definitive failures clear
+        /// return <c>true</c> so check-ins continue; without <see cref="OnFailure"/>
+        /// they write a one-line warning to stderr. Definitive failures clear
         /// the session before <see cref="OnFailure"/> runs and return <c>false</c>.
         /// A result for a session that was replaced or logged out meanwhile is dropped.
         /// </summary>
@@ -627,6 +628,11 @@ namespace AuthForge
                 }
             }
 
+            if (failure.IsTransient && OnFailure is null)
+            {
+                WarnFn($"AuthForge: background check failed ({failure.Code}); retrying next interval");
+                return true;
+            }
             Fail("heartbeat_failed", failure);
             return failure.IsTransient;
         }
@@ -1007,6 +1013,12 @@ namespace AuthForge
         /// <summary>Delay used between request retries; replaceable in tests.</summary>
         internal Action<TimeSpan> SleepFn { get; set; } = Thread.Sleep;
 
+        /// <summary>Process exit used when there is no <see cref="OnFailure"/>; replaceable in tests.</summary>
+        internal Action<int> ExitFn { get; set; } = Environment.Exit;
+
+        /// <summary>Writes the stderr warning for transient failures without <see cref="OnFailure"/>; replaceable in tests.</summary>
+        internal Action<string> WarnFn { get; set; } = message => Console.Error.WriteLine(message);
+
         private static Dictionary<string, JsonElement> ParseResponseObject(string rawResponse)
         {
             JsonDocument document;
@@ -1369,7 +1381,7 @@ namespace AuthForge
                 }
             }
 
-            Environment.Exit(1);
+            ExitFn(1);
         }
 
         private string ExtractServerError(Dictionary<string, JsonElement> responseObj)

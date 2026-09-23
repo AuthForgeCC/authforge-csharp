@@ -17,14 +17,20 @@ Prefer **`dotnet add package AuthForge`** from [NuGet](https://www.nuget.org/pac
 
 ```csharp
 using System;
+using System.Threading;
 using AuthForge;
+
+// Cancelled when the license is lost; the main loop watches it, saves work, then exits.
+using var licenseLost = new CancellationTokenSource();
 
 void OnFailure(string reason, Exception? exception)
 {
+    if (reason == "heartbeat_failed" && exception is AuthForgeException { IsTransient: true })
+        return; // network blip / rate_limited: the SDK checks in again next interval
     Console.Error.WriteLine($"AuthForge: {reason}");
     if (exception != null)
         Console.Error.WriteLine(exception);
-    Environment.Exit(1);
+    licenseLost.Cancel(); // runs on the heartbeat thread: signal, do not Environment.Exit here
 }
 
 var client = new AuthForgeClient(
@@ -45,9 +51,15 @@ if (!client.Login(licenseKey))
 
 // --- Your application code starts here ---
 Console.WriteLine("Running with a valid license.");
+while (!licenseLost.IsCancellationRequested)
+{
+    licenseLost.Token.WaitHandle.WaitOne(1000); // replace with short units of work
+}
 // --- Your application code ends here ---
 
+// Save the user's work here, then stop.
 client.Logout();
+return 1;
 ```
 
 This activates once online and then runs through the grace period with no further network traffic. To enable online check-ins for fast revocation, add `onlineHeartbeat: true` (and optionally tune `heartbeatInterval`).
@@ -62,7 +74,7 @@ This activates once online and then runs through the grace period with no furthe
 | `onlineHeartbeat` | `bool` | no | `false` | `false`: after activation, run through the grace period locally (no network). `true`: periodic online check-ins via `/auth/heartbeat` for fast revocation and concurrent-use detection |
 | `heartbeatInterval` | `int` | no | `900` | Seconds between background checks (minimum `10`; with online check-ins, revocations apply on the next check-in) |
 | `apiBaseUrl` | `string` | no | `https://auth.authforge.cc` | API base URL |
-| `onFailure` | `Action<string, Exception?>?` | no | `null` | Called on login/heartbeat failure; if null, `Environment.Exit(1)` (not used by `ValidateLicense`) |
+| `onFailure` | `Action<string, Exception?>?` | no | `null` | Called on login/heartbeat failure (not used by `ValidateLicense`). If null, a transient background check failure prints a one-line warning to stderr and check-ins continue; any other failure calls `Environment.Exit(1)` |
 | `requestTimeout` | `int` | no | `15` | HTTP timeout (seconds) |
 | `ttlSeconds` | `int?` | no | `null` (server default: 86400, 24h) | Requested grace period duration in seconds (the session token lifetime). Server clamps to `[3600, 604800]` (1h to 7d); preserved across online check-in refreshes. |
 | `hwidOverride` | `string?` | no | `null` | Optional custom HWID/subject string. When set to a non-empty value (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
@@ -134,7 +146,7 @@ Background check failures call `onFailure("heartbeat_failed", ex)` with `ex` an 
 - `blocked` on a check-in: the HWID or IP is blacklisted, or not on the app's whitelist.
 - `unexpected_response`: the failed body was not a well-formed verdict (`{"status":"failed","error":"<code>"}`), e.g. a proxy answered; the message carries the raw `status` / `error`.
 - Heartbeat network failures are reported once (`heartbeat_failed` with `network_error` / `timeout`), not also as `network_error`.
-- Transient failures keep checking in only if `onFailure` returns; without a callback every failure calls `Environment.Exit(1)`.
+- Transient failures keep checking in only if `onFailure` returns; without a callback a transient failure prints a one-line stderr warning and check-ins continue, and any other failure calls `Environment.Exit(1)`.
 - Thread safety: `onFailure` for `heartbeat_failed` runs on the heartbeat thread with no SDK lock held. Calling `Logout()` / `IsAuthenticated()` (or `Login()`) from it is safe; `Logout()` never waits for the thread. A late check-in response after `Logout()` / `Login()` is discarded.
 
 ```csharp
@@ -143,9 +155,11 @@ onFailure: (reason, ex) =>
     if (ex is AuthForgeException { IsTransient: true })
         return; // outage or overload: keep running, the SDK checks in again
     Console.Error.WriteLine($"AuthForge: {reason} ({(ex as AuthForgeException)?.Code ?? ex?.Message})");
-    Environment.Exit(1);
+    licenseLost.Cancel(); // the main loop saves work and exits
 }
 ```
+
+`Environment.Exit(1)` inside `onFailure` is a last resort: `finally` blocks on other threads do not run, so save the user's work first. In WinForms/WPF, marshal to the UI thread (`BeginInvoke`) and close the main window instead.
 
 ## Common patterns
 
@@ -194,7 +208,7 @@ onFailure: (reason, ex) =>
     var code = ex is AuthForgeException afe ? afe.Code : ex?.Message;
     if (code is "invalid_key" or "expired" or "revoked")
         Console.Error.WriteLine($"License: {code}");
-    Environment.Exit(1);
+    licenseLost.Cancel();
 }
 ```
 
@@ -202,7 +216,8 @@ onFailure: (reason, ex) =>
 
 - Do not hardcode the app secret as a plain string literal in source: use environment variables or encrypted config
 - Do not embed the App Secret in air-gapped / `LoginFromFile()` builds: pass `""`; verification only needs app id + public key
-- Do not skip `onFailure`: without it, failures call `Environment.Exit(1)` without your cleanup
+- Do not skip `onFailure`: without it, transient check-in failures only print a stderr warning, but definitive ones (and a failed `Login`) call `Environment.Exit(1)` without your cleanup
+- Do not call `Environment.Exit` from `onFailure` as the normal shutdown path: signal the main thread (a `CancellationTokenSource`, or `BeginInvoke` in a UI app) so it can save work and exit cleanly
 - Do not call `Login` on every app action: call once at startup; the grace period or online check-ins handle the rest
 - Do not pass the legacy `heartbeatMode` string in new code: the default already gives you the grace period, and `onlineHeartbeat: true` replaces `"SERVER"`
 - Do not treat the grace period as persistent offline licensing: it is session continuation after one successful online activation, and revocations are only picked up at the next online validate or check-in

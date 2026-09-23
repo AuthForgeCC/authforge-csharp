@@ -226,6 +226,50 @@ public class HeartbeatTests
     }
 
     [Fact]
+    public void WithoutOnFailure_TransientFailure_WarnsAndContinues()
+    {
+        using var server = ScriptedServer.Respond((503, FailedBody("system_error")));
+        using var harness = new Harness(server.BaseUrl, withOnFailure: false);
+        harness.SeedOnlineSession();
+
+        Assert.True(harness.Client.HeartbeatTick());
+
+        Assert.Empty(harness.Exits);
+        Assert.Equal(
+            new[] { "AuthForge: background check failed (system_error); retrying next interval" },
+            harness.Warnings);
+        Assert.True(harness.Client.IsAuthenticated());
+    }
+
+    [Theory]
+    [InlineData(410, "revoked", 3600)]
+    [InlineData(503, "system_error", -60)]
+    public void WithoutOnFailure_DefinitiveFailure_Exits(int httpStatus, string code, int expiresInOffset)
+    {
+        using var server = ScriptedServer.Respond((httpStatus, FailedBody(code)));
+        using var harness = new Harness(server.BaseUrl, withOnFailure: false);
+        harness.SeedOnlineSession(expiresIn: DateTimeOffset.UtcNow.ToUnixTimeSeconds() + expiresInOffset);
+
+        Assert.False(harness.Client.HeartbeatTick());
+
+        Assert.Equal(new[] { 1 }, harness.Exits);
+        Assert.Empty(harness.Warnings);
+        Assert.False(harness.Client.IsAuthenticated());
+    }
+
+    [Fact]
+    public void WithoutOnFailure_LoginFailure_Exits()
+    {
+        using var server = ScriptedServer.Respond((401, FailedBody("invalid_key")));
+        using var harness = new Harness(server.BaseUrl, withOnFailure: false);
+
+        Assert.False(harness.Client.Login("license-key"));
+
+        Assert.Equal(new[] { 1 }, harness.Exits);
+        Assert.Empty(harness.Warnings);
+    }
+
+    [Fact]
     public void SuccessAfterTransientFailure_RefreshesSession()
     {
         var heartbeat = Vectors.Case("heartbeat_success");
@@ -555,12 +599,15 @@ public class HeartbeatTests
         private readonly object _gate = new();
         private readonly List<(string Reason, Exception? Error)> _failures = new();
         private readonly List<TimeSpan> _sleeps = new();
+        private readonly List<int> _exits = new();
+        private readonly List<string> _warnings = new();
 
         public Harness(
             string baseUrl,
             bool onlineHeartbeat = true,
             int requestTimeout = 5,
-            Action<AuthForgeClient, string, Exception?>? onFailure = null)
+            Action<AuthForgeClient, string, Exception?>? onFailure = null,
+            bool withOnFailure = true)
         {
             Client = new AuthForgeClient(
                 "app-id",
@@ -569,14 +616,16 @@ public class HeartbeatTests
                 onlineHeartbeat: onlineHeartbeat,
                 heartbeatInterval: 3600,
                 apiBaseUrl: baseUrl,
-                onFailure: (reason, ex) =>
-                {
-                    lock (_gate)
+                onFailure: withOnFailure
+                    ? (reason, ex) =>
                     {
-                        _failures.Add((reason, ex));
+                        lock (_gate)
+                        {
+                            _failures.Add((reason, ex));
+                        }
+                        onFailure?.Invoke(Client!, reason, ex);
                     }
-                    onFailure?.Invoke(Client!, reason, ex);
-                },
+                    : null,
                 requestTimeout: requestTimeout,
                 hwidOverride: "test-hwid");
             Client.SleepFn = delay =>
@@ -586,6 +635,42 @@ public class HeartbeatTests
                     _sleeps.Add(delay);
                 }
             };
+            Client.ExitFn = code =>
+            {
+                lock (_gate)
+                {
+                    _exits.Add(code);
+                }
+            };
+            Client.WarnFn = message =>
+            {
+                lock (_gate)
+                {
+                    _warnings.Add(message);
+                }
+            };
+        }
+
+        public IReadOnlyList<int> Exits
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _exits.ToList();
+                }
+            }
+        }
+
+        public IReadOnlyList<string> Warnings
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _warnings.ToList();
+                }
+            }
         }
 
         public AuthForgeClient Client { get; }

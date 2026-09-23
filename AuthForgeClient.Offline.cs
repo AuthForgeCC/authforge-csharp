@@ -67,7 +67,7 @@ namespace AuthForge
         private const string ActivationRequestTyp = "authforge-activation-request";
         private const string BeginActivationRequest = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----";
         private const string EndActivationRequest = "-----END AUTHFORGE ACTIVATION REQUEST-----";
-        private const string ActivationRequestSdkTag = "csharp/1.4.0";
+        private const string ActivationRequestSdkTag = "csharp/1.4.1";
         private const int ArmorLineWidth = 64;
         private const int MaxRequestHwid = 256;
         private const int MaxRequestMachineName = 128;

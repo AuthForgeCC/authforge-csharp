@@ -392,7 +392,13 @@ public class HeartbeatTests
     public void DefinitiveErrorCodes_IsTheAllowlist()
     {
         Assert.Equal(
-            new[] { "app_disabled", "blocked", "expired", "hwid_mismatch", "invalid_app", "malformed_request", "revoked", "session_expired", "signature_mismatch" },
+            new[]
+            {
+                "app_disabled", "blocked", "expired", "hwid_mismatch", "invalid_app", "malformed_request",
+                "offline_activation_disabled", "offline_activation_limit_reached", "offline_activation_requires_perpetual",
+                "offline_activation_requires_seats", "offline_file_rejected",
+                "revoked", "session_expired", "signature_mismatch",
+            },
             AuthForgeClient.DefinitiveErrorCodes.OrderBy(c => c, StringComparer.Ordinal));
     }
 

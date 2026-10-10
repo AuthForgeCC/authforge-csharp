@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0
+
+### Features
+
+- **Self-serve offline activation: `ActivateOffline(string licenseKey, string? path = null)`.** One online call to `POST /auth/offline/activate` turns a license key into a lifetime, HWID-bound `.authforge` file. The SDK verifies the file locally (signature against the configured public key(s), app id, this machine's HWID) before writing anything, writes it byte-for-byte and atomically to `path` (temp file + rename, parent directories created) when `path` is set, and starts an offline session exactly as `LoginFromFile()` does (no background thread). Later launches use `LoginFromFile(path)` with no network.
+  - Needs the App Secret (it is an online call); without it, throws the same `ArgumentException` as `Login()` before any request. Air-gapped offline files still ship with no App Secret.
+  - Uses the same HWID, nonce generator, base URL, timeout and retry policy as `Login()`.
+  - Failures throw `AuthForgeException`. It never calls `onFailure` or `Environment.Exit`, never writes a file that failed verification, never modifies an existing file at `path` on failure, and does not authenticate the client (an existing session is left as it was).
+  - Billing: 1 new offline activation = 2 credits, charged to the app owner; re-activating the same machine is free and returns the identical file.
+- New fatal codes (in `DefinitiveErrorCodes` and the known-code list): `offline_activation_disabled`, `offline_activation_requires_perpetual`, `offline_activation_requires_seats`, `offline_activation_limit_reached` (server) and `offline_file_rejected` (SDK: the returned file failed local verification; the verifier's reason, e.g. `bad_signature`, is in the message). New transient SDK code `file_write_failed` (the file could not be saved; activating again is free). A success response without `file` is `unexpected_response`.
+- New source file `AuthForgeClient.OfflineActivation.cs` (add it if you vendor the sources).
+- Tests against the shared `self_serve_activation_vectors.json`.
+
 ## 1.4.1
 
 ### Fixes

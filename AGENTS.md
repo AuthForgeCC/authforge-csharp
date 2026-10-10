@@ -9,9 +9,11 @@ AuthForge is a license key validation service. Your app activates online: it sen
 
 There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `LoginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (pass `""`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `Login()` + grace period. To collect the HWID for a bound file, write an **activation request** (`.authforge-request`) with `CreateActivationRequest`. It is not a license, is not signed, and does not mint anything. Prefer it over printing the raw HWID.
 
+A third mode, also **separate** from air-gapped files, is **self-serve offline activation** for one-time-purchase apps: `ActivateOffline(licenseKey, path)` makes one online call (`POST /auth/offline/activate`) that returns a lifetime `.authforge` file bound to this machine's HWID, verifies it locally, saves it and starts an offline session; later launches use `LoginFromFile(path)` with no network. Unlike air-gapped builds, this mode **needs the App Secret** in the build. The app must have self-serve offline activation enabled, and the license must be perpetual and seat-limited. Only use it when the user asks for "activate once, then run offline" licensing.
+
 ## Installation
 
-Prefer **`dotnet add package AuthForge`** from [NuGet](https://www.nuget.org/packages/AuthForge/). Targets .NET 6+ (see the `.csproj` for package references such as `BouncyCastle.Cryptography`). You can instead copy `AuthForgeClient.cs`, `AuthForgeClient.Offline.cs` and `AuthForgeException.cs` if you truly need a source-only integration and mirror its dependencies yourself.
+Prefer **`dotnet add package AuthForge`** from [NuGet](https://www.nuget.org/packages/AuthForge/). Targets .NET 6+ (see the `.csproj` for package references such as `BouncyCastle.Cryptography`). You can instead copy `AuthForgeClient.cs`, `AuthForgeClient.Offline.cs`, `AuthForgeClient.OfflineActivation.cs` and `AuthForgeException.cs` if you truly need a source-only integration and mirror its dependencies yourself.
 
 ## Minimal working integration
 
@@ -69,7 +71,7 @@ This activates once online and then runs through the grace period with no furthe
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `appId` | `string` | yes | n/a | Application ID |
-| `appSecret` | `string` | for online APIs | n/a | Application secret. Required for `Login` / `ValidateLicense` / `SelfBan`. Pass `""` for `LoginFromFile` only; do not ship it in air-gapped binaries. |
+| `appSecret` | `string` | for online APIs | n/a | Application secret. Required for `Login` / `ValidateLicense` / `SelfBan` / `ActivateOffline`. Pass `""` for `LoginFromFile` only; do not ship it in air-gapped binaries. |
 | `publicKey` | `string` / `IEnumerable<string>` | yes | n/a | Base64 Ed25519 public key from the dashboard (3rd positional arg; no default, so it must be supplied or the call won't compile). The string overload accepts a comma-separated trust list; an `IEnumerable<string>` overload takes a rotation set. The SDK trusts a signature matching **any** key |
 | `onlineHeartbeat` | `bool` | no | `false` | `false`: after activation, run through the grace period locally (no network). `true`: periodic online check-ins via `/auth/heartbeat` for fast revocation and concurrent-use detection |
 | `heartbeatInterval` | `int` | no | `900` | Seconds between background checks (minimum `10`; with online check-ins, revocations apply on the next check-in) |
@@ -102,6 +104,7 @@ new AuthForgeClient(appId, appSecret, publicKey, onlineHeartbeat: true);
 - Each `Login()` or `ValidateLicense()` calls `/auth/validate` and costs **1 credit**.
 - Online check-ins cost **1 credit per 10 successful calls** (billed on every 10th heartbeat). The default grace period behavior makes no network calls after activation and costs nothing.
 - **1 offline file mint = 1 credit** (charged to the operator when the file is minted). `LoginFromFile()` / `VerifyLicenseFile()` cost nothing.
+- **1 new offline activation = 2 credits; re-activating the same machine is free.** Charged to the app owner when `ActivateOffline()` succeeds for a new machine; a refused activation costs nothing.
 - Keep `heartbeatInterval` at or above 10 seconds. `/auth/heartbeat` is limited to 6 requests/minute per license key; cost still scales with how many check-ins you send.
 - With online check-ins, revocations take effect on the **next** check-in regardless of interval. With the default grace period behavior, a revocation is only noticed at the next online activate/validate.
 
@@ -112,6 +115,7 @@ new AuthForgeClient(appId, appSecret, publicKey, onlineHeartbeat: true);
 | `Login(string licenseKey)` | `bool` | Activates online, verifies signatures, starts the background thread |
 | `ValidateLicense(string licenseKey)` | `ValidateLicenseResult` | Same validate + signatures as `Login`; no session persistence or background thread; **never** calls `onFailure` or `Environment.Exit` |
 | `LoginFromFile(string pathOrText)` | `bool` | Offline mode: verifies a `.authforge` file locally (no network), authenticates the client, never starts the background thread. Failures -> `onFailure("offline_login_failed", ex)` + `false`; never `Environment.Exit` |
+| `ActivateOffline(string licenseKey, string? path = null)` | `bool` | Self-serve offline activation: one online call returns a lifetime HWID-bound `.authforge` file; verified locally before anything is written, saved atomically to `path` (optional, parent dirs created), then an offline session exactly as after `LoginFromFile`. Requires the App Secret (`ArgumentException` without it). Failures throw `AuthForgeException`; never calls `onFailure` or `Environment.Exit`; a failure authenticates nothing and leaves an existing session as it was |
 | `VerifyLicenseFile(string pathOrText, DateTimeOffset? now = null)` | `VerifyLicenseFileResult` | Same offline checks without changing client state |
 | `GetOfflineLicense()` | `OfflineLicense?` | `Jti`, `ExpiresAt`, `HwidPolicy`, … of the offline file in use |
 | `GetSessionKind()` | `SessionKind?` | `SessionKind.Online`, `SessionKind.Offline`, or `null` when logged out |
@@ -125,9 +129,10 @@ new AuthForgeClient(appId, appSecret, publicKey, onlineHeartbeat: true);
 
 ## Error codes the server can return
 
-Full set: invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, app_burn_cap_reached, blocked, rate_limited, replay_detected, app_disabled, session_expired, revoke_requires_session, bad_request, malformed_request, demo_quota_exceeded, server_error, system_error. Unknown lowercase snake_case codes are passed through unchanged (e.g. in `ValidateLicenseResult.ErrorCode`).
+Full set: invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, app_burn_cap_reached, blocked, rate_limited, replay_detected, app_disabled, session_expired, revoke_requires_session, bad_request, malformed_request, demo_quota_exceeded, server_error, system_error. `/auth/offline/activate` (`ActivateOffline`) adds offline_activation_disabled, offline_activation_requires_perpetual, offline_activation_requires_seats, offline_activation_limit_reached. Unknown lowercase snake_case codes are passed through unchanged (e.g. in `ValidateLicenseResult.ErrorCode`).
 
 Notes:
+- `ActivateOffline` codes (all fatal): `offline_activation_disabled` (app has not opted in), `offline_activation_requires_perpetual` (license has an expiry), `offline_activation_requires_seats` (shared / unlimited-seat key), `offline_activation_limit_reached` (every machine slot used; HWID resets do not free them, so tell the buyer to contact the vendor). From this endpoint `hwid_mismatch` means "no free seat". SDK codes: `offline_file_rejected` (fatal; the returned file failed local verification, the verifier's reason is in `ex.Message`, nothing was written), `file_write_failed` (transient; could not save to `path`, the machine is activated and calling again is free), `unexpected_response` (transient; e.g. a success body without `file`).
 - `replay_detected` is validate-only. `rate_limited` can be returned by `/auth/validate` and `/auth/heartbeat` (heartbeat is license-limited at 6/min and has no app-layer IP limit).
 - `app_burn_cap_reached` means the app's configured credit burn cap is hit; `revoke_requires_session` means a pre-session self-ban tried to revoke a license (only session-authenticated self-ban can revoke).
 - `session_expired` from the background thread means the grace period ended; call `Login` again to re-activate.
@@ -196,6 +201,42 @@ if (!client.LoginFromFile("license.authforge"))
 
 Offline file error codes (in check order): `bad_armor`, `bad_signature`, `unsupported_version`, `malformed_payload`, `wrong_app`, `expired`, `hwid_mismatch`.
 
+### Self-serve offline activation (activate once, then offline; only when asked)
+
+Not the air-gapped flow above: this build ships the App Secret and makes one online call per machine. Try the file first; activate only when there is no file or it does not verify (new or changed hardware).
+
+```csharp
+var licensePath = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MyApp", "license.authforge");
+var client = new AuthForgeClient(appId: "YOUR_APP_ID", appSecret: "YOUR_APP_SECRET", publicKey: "YOUR_PUBLIC_KEY");
+
+if (!(File.Exists(licensePath) && client.LoginFromFile(licensePath)))
+{
+    var key = PromptForLicenseKey(); // app UI
+    try
+    {
+        client.ActivateOffline(key, licensePath); // verifies, writes atomically, starts an offline session
+    }
+    catch (AuthForgeException ex) when (ex.Code == "offline_activation_limit_reached")
+    {
+        ShowError("This license is activated on its maximum number of machines. Please contact the vendor.");
+        return;
+    }
+    catch (AuthForgeException ex)
+    {
+        ShowError(ex.IsTransient
+            ? $"Activation failed ({ex.Code}). Check your connection and try again."
+            : $"This license cannot be activated ({ex.Code}).");
+        return;
+    }
+}
+```
+
+- Billing: 1 new offline activation = 2 credits, charged to the app owner; re-activating the same machine (reinstall, deleted file) is free and returns the identical file.
+- Each license can produce files for at most `maxHwidSlots` distinct machines, ever; HWID resets do not free them.
+- A refund or chargeback revokes the license online but cannot reach files already issued: the buyer keeps a lifetime file.
+- With `onFailure` set, `LoginFromFile()` reports a failed file as `onFailure("offline_login_failed", ex)`; do not exit the app for that reason when falling back to `ActivateOffline()`.
+
 ### Custom error handling
 
 Reasons passed to `onFailure` include `login_failed` and `heartbeat_failed`. For `login_failed`, a server rejection surfaces as `ArgumentException` whose message is the server error code (e.g. `invalid_key`); network and HTTP errors are `AuthForgeException` (`network_error`, `timeout`, `http_error_<status>`). For `heartbeat_failed` it is always an `AuthForgeException` (see [Failure Handling](#failure-handling)).
@@ -215,7 +256,9 @@ onFailure: (reason, ex) =>
 ## Do NOT
 
 - Do not hardcode the app secret as a plain string literal in source: use environment variables or encrypted config
-- Do not embed the App Secret in air-gapped / `LoginFromFile()` builds: pass `""`; verification only needs app id + public key
+- Do not embed the App Secret in air-gapped / `LoginFromFile()` builds: pass `""`; verification only needs app id + public key. (Self-serve `ActivateOffline()` builds are the exception: that call is online and needs the secret.)
+- Do not call `ActivateOffline()` on every launch: call `LoginFromFile(path)` first and activate only when there is no file or it fails
+- Do not treat `ActivateOffline()`'s `hwid_mismatch` as a bad file: from that endpoint it means "no free seat"; a file that fails local checks is `offline_file_rejected`
 - Do not skip `onFailure`: without it, transient check-in failures only print a stderr warning, but definitive ones (and a failed `Login`) call `Environment.Exit(1)` without your cleanup
 - Do not call `Environment.Exit` from `onFailure` as the normal shutdown path: signal the main thread (a `CancellationTokenSource`, or `BeginInvoke` in a UI app) so it can save work and exit cleanly
 - Do not call `Login` on every app action: call once at startup; the grace period or online check-ins handle the rest

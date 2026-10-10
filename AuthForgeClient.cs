@@ -59,6 +59,11 @@ namespace AuthForge
             "demo_quota_exceeded",
             "server_error",
             "system_error",
+            "offline_activation_disabled",
+            "offline_activation_requires_perpetual",
+            "offline_activation_requires_seats",
+            "offline_activation_limit_reached",
+            "offline_file_rejected",
         };
         private static readonly Regex ServerErrorCodeRegex = new Regex("^[a-z][a-z0-9_]{0,63}$", RegexOptions.CultureInvariant);
         private static readonly string[] DefinitiveErrorCodeList =
@@ -72,6 +77,11 @@ namespace AuthForge
             "app_disabled",
             "invalid_app",
             "signature_mismatch",
+            "offline_activation_disabled",
+            "offline_activation_requires_perpetual",
+            "offline_activation_requires_seats",
+            "offline_activation_limit_reached",
+            "offline_file_rejected",
         };
         private static readonly HashSet<string> DefinitiveErrorCodeSet = new HashSet<string>(DefinitiveErrorCodeList, StringComparer.Ordinal);
 
@@ -111,7 +121,8 @@ namespace AuthForge
         public string AppId { get; }
         /// <summary>
         /// Application secret. Required for online APIs
-        /// (<see cref="Login"/>, <see cref="ValidateLicense"/>, <see cref="SelfBan"/>).
+        /// (<see cref="Login"/>, <see cref="ValidateLicense"/>, <see cref="SelfBan"/>,
+        /// <see cref="ActivateOffline"/>).
         /// May be empty for offline-only clients (<see cref="LoginFromFile"/>);
         /// air-gapped builds should not ship the secret.
         /// </summary>

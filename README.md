@@ -23,6 +23,7 @@ Everything in this list ships in `AuthForgeClient.cs` today:
 - **Seat enforcement**: the server binds each HWID into a license's free slots up to `maxHwidSlots`; `HwidCount` / `MaxHwidSlots` are surfaced on the validate result. A shared (unlimited-seat) key skips per-device binding.
 - **Grace period by default, online check-ins on demand** (see [Grace period and online check-ins](#grace-period-and-online-check-ins)).
 - **Offline license files (`.authforge`)**: `LoginFromFile()` / `VerifyLicenseFile()` verify a cloud-minted, Ed25519-signed file with zero network access for air-gapped machines.
+- **Self-serve offline activation**: `ActivateOffline()` turns a license key into a lifetime, HWID-bound `.authforge` file with one online call, so a one-time-purchase app runs offline from then on.
 - **Self-ban** (`SelfBan(...)`) for anti-tamper response, both pre-session and post-session.
 - **Grace period duration** (`ttlSeconds`) with server-side clamping to `[3600, 604800]` (1h to 7d).
 - **App variables / license variables** for feature flags and tiered licensing.
@@ -36,7 +37,7 @@ The package is **`AuthForge`** on [NuGet](https://www.nuget.org/packages/AuthFor
 dotnet add package AuthForge
 ```
 
-**Alternative:** copy `AuthForgeClient.cs`, `AuthForgeClient.Offline.cs` and `AuthForgeException.cs` into your solution if you need a source-only vendored layout (you still need the same NuGet dependencies declared in your project).
+**Alternative:** copy `AuthForgeClient.cs`, `AuthForgeClient.Offline.cs`, `AuthForgeClient.OfflineActivation.cs` and `AuthForgeException.cs` into your solution if you need a source-only vendored layout (you still need the same NuGet dependencies declared in your project).
 
 ## Quick Start
 
@@ -183,10 +184,96 @@ new AuthForgeClient(appId, appSecret, publicKey);
 new AuthForgeClient(appId, appSecret, publicKey, onlineHeartbeat: true);
 ```
 
+## Self-serve offline activation
+
+For apps sold as a one-time purchase that should run offline after one online step. The end user enters their license key once; `ActivateOffline(licenseKey, path)` calls `POST /auth/offline/activate`, gets back a **lifetime `.authforge` file bound to this machine's HWID**, checks it locally, saves it to `path` and starts an offline session. Every later launch loads the file with `LoginFromFile()` and makes no network calls.
+
+This is a separate mode from [air-gapped offline files](#offline-license-files-authforge):
+
+| | Air-gapped offline file | Self-serve offline activation |
+| --- | --- | --- |
+| Who mints the file | The operator (dashboard / Developer API) | The app, from the end user's license key |
+| App Secret in the build | No: pass `""` | **Yes: required** (it is an online call) |
+| Network on the end machine | Never | Once per machine |
+| Cost | 1 credit per mint | **2 credits per new machine**, charged to the app owner; re-activating the same machine is free |
+
+The server only issues a file when the app has enabled self-serve offline activation, the license is perpetual (no expiry) and the license is seat-limited (not a shared key).
+
+The app pattern: try the file first, activate only when there is no file or it does not verify (for example new hardware).
+
+```csharp
+var licensePath = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MyApp", "license.authforge");
+
+var client = new AuthForgeClient(
+    appId: "YOUR_APP_ID",
+    appSecret: "YOUR_APP_SECRET", // required for ActivateOffline
+    publicKey: "YOUR_PUBLIC_KEY");
+
+if (!(File.Exists(licensePath) && client.LoginFromFile(licensePath)))
+{
+    var key = PromptForLicenseKey(); // your UI
+    try
+    {
+        client.ActivateOffline(key, licensePath); // throws AuthForgeException on refusal
+    }
+    catch (AuthForgeException ex)
+    {
+        var message = ex.Code switch
+        {
+            "offline_activation_limit_reached" => "This license is already activated on its maximum number of machines. Please contact the vendor.",
+            "hwid_mismatch" => "All seats on this license are in use.",
+            "invalid_key" => "That license key is not valid.",
+            "revoked" or "expired" => "This license is no longer active.",
+            "offline_activation_disabled" or "offline_activation_requires_perpetual" or "offline_activation_requires_seats"
+                => "This license cannot be activated offline. Please contact the vendor.",
+            _ when ex.IsTransient => "Could not complete activation. Check your connection and try again.",
+            _ => $"Activation failed ({ex.Code}).",
+        };
+        ShowError(message);
+        return;
+    }
+}
+// Authenticated: GetSessionKind() == SessionKind.Offline, GetLicenseVariables(), GetOfflineLicense() ...
+```
+
+If you set `onFailure`, `LoginFromFile()` still reports a file that does not verify as `onFailure("offline_login_failed", ex)`, so do not exit the app for that reason when you fall back to activation. `ActivateOffline()` itself never calls `onFailure` or `Environment.Exit`.
+
+What `ActivateOffline(string licenseKey, string? path = null)` does:
+
+- **Requires the App Secret.** Without it, it throws the same `ArgumentException` as `Login()` before sending anything.
+- Sends `appId`, `appSecret`, `licenseKey`, the same `hwid` that `Login()` sends (including `hwidOverride`) and a fresh `nonce`, with the same retry policy as `Login()`.
+- **Verifies the returned file before writing anything**: signature against your public key(s), app id, and this machine's HWID. A file that fails is refused with `offline_file_rejected`; the verifier's reason (`bad_signature`, `wrong_app`, `hwid_mismatch`, ...) is in `ex.Message`.
+- When `path` is set, writes the file byte-for-byte and atomically (temp file in the same directory, then rename), creating parent directories. On any failure an existing file at `path` is left untouched. With `path` omitted, nothing is written and only the session starts.
+- On success, returns `true` and leaves the client exactly as `LoginFromFile()` would: offline session, variables, `GetOfflineLicense()`, no background thread.
+- On failure, throws `AuthForgeException` and authenticates nothing: an existing session is left as it was. On success it replaces any current session, as `LoginFromFile()` does.
+
+Errors (`ex.Code`):
+
+| Code | Fatal | Meaning |
+| --- | --- | --- |
+| `offline_activation_disabled` | yes | The app has not enabled self-serve offline activation |
+| `offline_activation_requires_perpetual` | yes | The license has an expiry; only perpetual licenses can self-serve |
+| `offline_activation_requires_seats` | yes | Shared (unlimited-seat) licenses cannot self-serve |
+| `offline_activation_limit_reached` | yes | Every machine slot on the license is used. HWID resets do not free them: tell the buyer to contact the vendor |
+| `hwid_mismatch` | yes | No free seat for this machine |
+| `offline_file_rejected` | yes | The returned file failed local verification; nothing was written |
+| `revoked`, `expired`, `blocked`, `invalid_app`, `app_disabled` | yes | As for `Login()` |
+| `invalid_key`, `no_credits`, `rate_limited`, `system_error`, `network_error`, `timeout`, `unexpected_response`, `http_error_<status>` | no | As for `Login()`; `unexpected_response` also covers a success response with no file |
+| `file_write_failed` | no | The file could not be saved to `path`. The machine is activated, so calling again returns the same file for free |
+
+Billing and limits:
+
+- **1 new offline activation = 2 credits**, charged to the app owner. A refused activation costs nothing.
+- **Re-activating the same machine is free**: a reinstall or a deleted file gets the identical file back.
+- A license can produce files for at most `maxHwidSlots` distinct machines, ever. HWID resets do not give machine slots back; the vendor can release a machine or raise the seat count.
+- **A refund or chargeback revokes the license online but cannot reach files already issued.** For a lifetime file, the buyer keeps the app.
+
 ## Billing
 
 - **One `Login()` or `ValidateLicense()` call = 1 credit** (one `/auth/validate` debit each).
 - **10 online check-ins on the same session = 1 credit** (debited on every 10th successful heartbeat). The default grace period behavior makes no heartbeat calls and costs nothing after activation.
+- **1 new offline activation (`ActivateOffline()`) = 2 credits**; re-activating the same machine is free. `LoginFromFile()` costs nothing.
 
 A desktop app running 6h/day with online check-ins at a 15-minute interval burns ~3-4 credits/day. `/auth/heartbeat` is limited to 6 requests/minute per license key, so keep intervals at 10 seconds or higher and choose cadence based on revocation speed needs (they always land on the **next** check-in).
 
@@ -198,6 +285,7 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 | `ValidateLicense(string licenseKey)` | `ValidateLicenseResult` | Same `/auth/validate` + signatures as `Login`; does not update client session or start the background thread; **never** calls `onFailure` or `Environment.Exit` |
 | `SelfBan(...)` | `Dictionary<string, object?>` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
 | `LoginFromFile(string pathOrText)` | `bool` | Authorizes from an offline `.authforge` file with no network; never starts the background thread; failures go to `onFailure("offline_login_failed", …)` |
+| `ActivateOffline(string licenseKey, string? path = null)` | `bool` | Self-serve offline activation: one online call returns a lifetime HWID-bound `.authforge` file, verified locally, saved atomically to `path` (optional), then an offline session as after `LoginFromFile`. Needs the App Secret; throws `AuthForgeException` on failure; never calls `onFailure` or `Environment.Exit` |
 | `VerifyLicenseFile(string pathOrText, DateTimeOffset? now = null)` | `VerifyLicenseFileResult` | Verifies a `.authforge` file with this client's app id / keys / HWID without changing state |
 | `GetOfflineLicense()` | `OfflineLicense?` | Metadata of the offline file in use (`Jti`, `ExpiresAt`, `HwidPolicy`, …) |
 | `GetSessionKind()` | `SessionKind?` | `SessionKind.Online`, `SessionKind.Offline`, or `null` when logged out |
@@ -216,7 +304,7 @@ If authentication fails, the SDK calls your `onFailure` callback if one is provi
 **`ValidateLicense()`** returns a result object instead; it does not invoke `onFailure` or exit for validate/network failures.
 
 Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `demo_quota_exceeded`, `server_error`, `system_error`. Codes added to the server later are passed through unchanged.
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `demo_quota_exceeded`, `server_error`, `system_error`, and for `ActivateOffline()` `offline_activation_disabled`, `offline_activation_requires_perpetual`, `offline_activation_requires_seats`, `offline_activation_limit_reached`. Codes added to the server later are passed through unchanged.
 
 Request retries are automatic inside the internal HTTP layer:
 - `rate_limited`, or HTTP 429 with no error code: retry after 2s, then 5s (max 3 attempts total). HTTP 429 with `no_credits`, `app_burn_cap_reached` or `demo_quota_exceeded` is not retried.
@@ -234,6 +322,8 @@ Background check failures reach `onFailure("heartbeat_failed", ex)`, where `ex` 
 |---|---|---|
 | Fatal | `revoked`, `expired`, `hwid_mismatch` (the HWID is no longer bound, for example after an HWID reset), `blocked` (HWID/IP blacklisted or not whitelisted), `session_expired` (also the grace period ending), `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` | Clears the stored session (as `Logout()` does) and stops background checks **before** calling `onFailure`, so `IsAuthenticated()` is `false`. `onFailure` may call `Login()` again. |
 | Transient | Everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `server_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, `http_error_<status>`, `unexpected_response`, unknown codes | Keeps the session and checks in again on the next `heartbeatInterval`. Once the signed session's TTL has passed, the next transient failure is reported as a fatal `session_expired` instead. |
+
+`DefinitiveErrorCodes` also contains the [self-serve offline activation](#self-serve-offline-activation) codes (`offline_activation_disabled`, `offline_activation_requires_perpetual`, `offline_activation_requires_seats`, `offline_activation_limit_reached`, `offline_file_rejected`). Only `ActivateOffline()` produces them, never a check-in.
 
 `unexpected_response` means a failed check-in body was not a well-formed AuthForge verdict (`{"status":"failed","error":"<code>"}`), for example a proxy or captive portal answering instead of AuthForge; the message includes the raw `status` and `error` values.
 
@@ -320,7 +410,7 @@ client.SelfBan(
 
 ## Test Vectors
 
-The `test_vectors.json` file is shared across all SDKs and validates cross-language Ed25519 verification behavior. `offline_license_vectors.json` (generated from a fixed test seed in the Node SDK repo) is the cross-SDK conformance suite for `.authforge` offline license files: good files plus the `bad_signature`, wrong key, `wrong_app`, `expired`, `hwid_mismatch`, `unsupported_version` and `bad_armor` rejects.
+The `test_vectors.json` file is shared across all SDKs and validates cross-language Ed25519 verification behavior. `offline_license_vectors.json` (generated from a fixed test seed in the Node SDK repo) is the cross-SDK conformance suite for `.authforge` offline license files: good files plus the `bad_signature`, wrong key, `wrong_app`, `expired`, `hwid_mismatch`, `unsupported_version` and `bad_armor` rejects. `self_serve_activation_vectors.json` is the cross-SDK conformance suite for `ActivateOffline()`: mocked `/auth/offline/activate` responses with the expected outcome, written file, error code and classification.
 
 ## Requirements
 
